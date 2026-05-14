@@ -1,0 +1,12 @@
+.snakemake/
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.log
+.DS_Store
+*.swp
+*.swo
+.venv/
+venv/
+env/

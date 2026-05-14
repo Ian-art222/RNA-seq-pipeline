@@ -1,0 +1,29 @@
+paths:
+  clean_dir: "cleandata"
+  align_dir: "alignment"
+  quant_dir: "quantification"
+  logs_dir: "logs"
+reference:
+  # HISAT2 索引前缀（不含 .*.ht2 后缀）；见 /home/pipeline/3.Ct_ZJ_genome/hisat2_index/
+  hisat2_index_prefix: "/home/pipeline/3.Ct_ZJ_genome/hisat2_index/Ct_ZJ_T2T_index"
+  # StringTie / 矩阵整理用注释；本机为 GFF3
+  annotation: "/home/pipeline/3.Ct_ZJ_genome/Ct_ZJ_T2T_gene.gff3"
+sample_scan:
+  # workdir/cleandata 下实际为 {sample}_1.fastq.gz / {sample}_2.fastq.gz
+  r1_suffix: "_1.fastq.gz"
+  r2_suffix: "_2.fastq.gz"
+  strict: true
+alignment:
+  mapq_filter: 0
+  hisat2_extra: ""
+stringtie:
+  use_ballgown: true
+  extra: ""
+threads:
+  hisat2: 16
+  samtools_view: 8
+  samtools_sort: 8
+  samtools_index: 4
+  stringtie: 16
+output:
+  xlsx: "quantification/gene_expression_matrices.xlsx"

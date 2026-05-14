@@ -1,0 +1,293 @@
+import os
+from pathlib import Path
+
+# 相对路径在 Snakemake 8+ 中默认相对 --directory，故改为相对 Snakefile 所在仓库根目录
+configfile: str(Path(workflow.basedir).resolve().parent / "config" / "config.yaml")
+shell.executable("/bin/bash")
+WORKDIR = Path(workflow.workdir_init).resolve()
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+def workdir_path(rel: str) -> Path:
+    p = Path(rel).expanduser()
+    return p if p.is_absolute() else (WORKDIR / p).resolve()
+CLEAN_DIR = workdir_path(config["paths"]["clean_dir"])
+ALIGN_DIR = workdir_path(config["paths"]["align_dir"])
+QUANT_DIR = workdir_path(config["paths"]["quant_dir"])
+LOG_DIR = workdir_path(config["paths"].get("logs_dir", "logs"))
+PREPDE_SCRIPT = SCRIPTS_DIR / "prepDE.py"
+XLSX_OUT = workdir_path(config["output"]["xlsx"])
+HISAT2_INDEX_PREFIX = str(Path(config["reference"]["hisat2_index_prefix"]).expanduser())
+ANNOTATION = str(Path(config["reference"]["annotation"]).expanduser())
+R1_SUFFIX = config["sample_scan"]["r1_suffix"]
+R2_SUFFIX = config["sample_scan"]["r2_suffix"]
+STRICT_SCAN = bool(config["sample_scan"].get("strict", True))
+ALIGN_DIR.mkdir(parents=True, exist_ok=True)
+QUANT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+ALIGN_RULE_THREADS = (
+    int(config["threads"]["hisat2"])
+    + int(config["threads"]["samtools_view"])
+    + int(config["threads"]["samtools_sort"])
+)
+INDEX_RULE_THREADS = int(config["threads"]["samtools_index"])
+STRINGTIE_RULE_THREADS = int(config["threads"]["stringtie"])
+def discover_samples(clean_dir: Path):
+    samples = []
+    skipped = []
+    if not clean_dir.exists():
+        raise ValueError(f"[ERROR] clean_dir does not exist: {clean_dir}")
+    for item in sorted(clean_dir.iterdir()):
+        if not item.is_dir():
+            continue
+        sample = item.name
+        r1 = item / f"{sample}{R1_SUFFIX}"
+        r2 = item / f"{sample}{R2_SUFFIX}"
+        if r1.exists() and r2.exists():
+            samples.append(sample)
+        else:
+            skipped.append((sample, str(r1), str(r2)))
+    if skipped and STRICT_SCAN:
+        details = "\n".join(
+            [f"  - {sample}\n    missing pair for:\n    {r1}\n    {r2}" for sample, r1, r2 in skipped]
+        )
+        raise ValueError(
+            "[ERROR] Incomplete sample directories found under clean_dir while strict=true:\n"
+            f"{details}"
+        )
+    if skipped and not STRICT_SCAN:
+        print("[WARN] Incomplete sample directories skipped because strict=false:")
+        for sample, r1, r2 in skipped:
+            print(f"  - {sample}")
+            print(f"    expected: {r1}")
+            print(f"    expected: {r2}")
+    if not samples:
+        raise ValueError(
+            f"[ERROR] No valid samples found under {clean_dir}. "
+            f"Expected structure: cleandata/{{sample}}/{{sample}}{R1_SUFFIX} and {R2_SUFFIX}"
+        )
+    print(f"[INFO] Discovered {len(samples)} samples:")
+    for s in samples:
+        print(f"  - {s}")
+    return samples
+SAMPLES = discover_samples(CLEAN_DIR)
+def get_r1(wc):
+    return str(CLEAN_DIR / wc.sample / f"{wc.sample}{R1_SUFFIX}")
+def get_r2(wc):
+    return str(CLEAN_DIR / wc.sample / f"{wc.sample}{R2_SUFFIX}")
+def mapq_option():
+    q = int(config["alignment"].get("mapq_filter", 0))
+    return "" if q <= 0 else f"-q {q}"
+def ballgown_option():
+    return "-B" if bool(config["stringtie"].get("use_ballgown", True)) else ""
+rule all:
+    input:
+        str(ALIGN_DIR / "alignment_report.csv"),
+        str(QUANT_DIR / "gene_count_matrix.csv"),
+        str(QUANT_DIR / "gene_fpkm_matrix.csv"),
+        str(QUANT_DIR / "gene_tpm_matrix.csv"),
+        str(XLSX_OUT)
+rule hisat2_align_sort:
+    input:
+        r1=get_r1,
+        r2=get_r2
+    output:
+        bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam"),
+        summary=str(ALIGN_DIR / "{sample}" / "{sample}.align_summary.txt")
+    log:
+        str(LOG_DIR / "{sample}" / "hisat2_align_sort.log")
+    params:
+        index=HISAT2_INDEX_PREFIX,
+        hisat2_extra=config["alignment"].get("hisat2_extra", ""),
+        mapq=mapq_option(),
+        hisat2_threads=int(config["threads"]["hisat2"]),
+        view_threads=int(config["threads"]["samtools_view"]),
+        sort_threads=int(config["threads"]["samtools_sort"])
+    threads: ALIGN_RULE_THREADS
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname '{output.bam}')" "$(dirname '{log}')"
+        exec 2> '{log}'
+        echo "[INFO] HISAT2 + samtools alignment started for sample: {wildcards.sample}" >&2
+        hisat2 --dta \
+          --summary-file '{output.summary}' \
+          -p {params.hisat2_threads} \
+          {params.hisat2_extra} \
+          -x '{params.index}' \
+          -1 '{input.r1}' \
+          -2 '{input.r2}' \
+        | samtools view -b {params.mapq} -@ {params.view_threads} - \
+        | samtools sort -@ {params.sort_threads} -o '{output.bam}' -
+        echo "[INFO] HISAT2 + samtools alignment finished for sample: {wildcards.sample}" >&2
+        """
+rule samtools_index:
+    input:
+        bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam")
+    output:
+        bai=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam.bai")
+    log:
+        str(LOG_DIR / "{sample}" / "samtools_index.log")
+    threads: INDEX_RULE_THREADS
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname '{log}')"
+        exec > '{log}' 2>&1
+        echo "[INFO] samtools index started for sample: {wildcards.sample}"
+        samtools index -@ {threads} '{input.bam}' '{output.bai}'
+        echo "[INFO] samtools index finished for sample: {wildcards.sample}"
+        """
+rule stringtie_quant:
+    input:
+        bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam"),
+        bai=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam.bai"),
+        annotation=ANNOTATION
+    output:
+        gtf=str(QUANT_DIR / "{sample}" / "{sample}.gtf"),
+        abundance=str(QUANT_DIR / "{sample}" / "{sample}_abundance.tab")
+    log:
+        str(LOG_DIR / "{sample}" / "stringtie_quant.log")
+    params:
+        ballgown=ballgown_option(),
+        extra=config["stringtie"].get("extra", ""),
+        stringtie_threads=int(config["threads"]["stringtie"])
+    threads: STRINGTIE_RULE_THREADS
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname '{output.gtf}')" "$(dirname '{log}')"
+        exec > '{log}' 2>&1
+        echo "[INFO] StringTie quantification started for sample: {wildcards.sample}"
+        stringtie '{input.bam}' \
+          -G '{input.annotation}' \
+          -p {params.stringtie_threads} \
+          -A '{output.abundance}' \
+          -e \
+          {params.ballgown} \
+          {params.extra} \
+          -o '{output.gtf}'
+        echo "[INFO] StringTie quantification finished for sample: {wildcards.sample}"
+        """
+rule build_sample_list:
+    input:
+        expand(str(QUANT_DIR / "{sample}" / "{sample}.gtf"), sample=SAMPLES)
+    output:
+        str(QUANT_DIR / "sample_lst.txt")
+    log:
+        str(LOG_DIR / "build_sample_list.log")
+    run:
+        Path(output[0]).parent.mkdir(parents=True, exist_ok=True)
+        Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
+        with open(output[0], "w") as out:
+            for sample in SAMPLES:
+                gtf_path = os.path.abspath(str(QUANT_DIR / sample / f"{sample}.gtf"))
+                out.write(f"{sample}\t{gtf_path}\n")
+        with open(log[0], "w") as lf:
+            lf.write(f"[INFO] Wrote sample list for {len(SAMPLES)} samples: {output[0]}\n")
+rule build_alignment_report:
+    input:
+        summaries=expand(str(ALIGN_DIR / "{sample}" / "{sample}.align_summary.txt"), sample=SAMPLES)
+    output:
+        report=str(ALIGN_DIR / "alignment_report.csv")
+    log:
+        str(LOG_DIR / "build_alignment_report.log")
+    params:
+        script=str(SCRIPTS_DIR / "build_alignment_report.py")
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname '{log}')"
+        exec > '{log}' 2>&1
+        python '{params.script}' \
+          --output '{output.report}' \
+          {input.summaries}
+        """
+rule prepde_raw_counts:
+    input:
+        sample_lst=str(QUANT_DIR / "sample_lst.txt"),
+        gtf_files=expand(str(QUANT_DIR / "{sample}" / "{sample}.gtf"), sample=SAMPLES)
+    output:
+        raw_count=str(QUANT_DIR / "gene_count_matrix.raw.csv"),
+        transcript_count=str(QUANT_DIR / "transcript_count_matrix.csv")
+    log:
+        str(LOG_DIR / "prepde_raw_counts.log")
+    params:
+        prepde=str(PREPDE_SCRIPT),
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname '{log}')"
+        exec > '{log}' 2>&1
+        if [ ! -f '{params.prepde}' ]; then
+          echo "[ERROR] prepDE.py not found at: {params.prepde}" >&2
+          echo "[ERROR] The pipeline expects workflow/scripts/prepDE.py to be bundled with the source code." >&2
+          exit 1
+        fi
+        python '{params.prepde}' \
+          -i '{input.sample_lst}' \
+          -g '{output.raw_count}' \
+          -t '{output.transcript_count}'
+        """
+rule finalize_expression_matrices:
+    input:
+        raw_count=str(QUANT_DIR / "gene_count_matrix.raw.csv"),
+        abundance_tabs=expand(str(QUANT_DIR / "{sample}" / "{sample}_abundance.tab"), sample=SAMPLES),
+        annotation=ANNOTATION
+    output:
+        count_matrix=str(QUANT_DIR / "gene_count_matrix.csv"),
+        fpkm=str(QUANT_DIR / "gene_fpkm_matrix.csv"),
+        tpm=str(QUANT_DIR / "gene_tpm_matrix.csv")
+    log:
+        str(LOG_DIR / "finalize_expression_matrices.log")
+    params:
+        script=str(SCRIPTS_DIR / "build_expression_matrices.py")
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname '{log}')"
+        exec > '{log}' 2>&1
+        python '{params.script}' \
+          --annotation '{input.annotation}' \
+          --raw-count '{input.raw_count}' \
+          --out-count '{output.count_matrix}' \
+          --out-fpkm '{output.fpkm}' \
+          --out-tpm '{output.tpm}' \
+          {input.abundance_tabs}
+        """
+rule export_expression_xlsx:
+    input:
+        alignment_report=str(ALIGN_DIR / "alignment_report.csv"),
+        count_matrix=str(QUANT_DIR / "gene_count_matrix.csv"),
+        fpkm=str(QUANT_DIR / "gene_fpkm_matrix.csv"),
+        tpm=str(QUANT_DIR / "gene_tpm_matrix.csv")
+    output:
+        xlsx=str(XLSX_OUT)
+    log:
+        str(LOG_DIR / "export_expression_xlsx.log")
+    params:
+        script=str(SCRIPTS_DIR / "export_expression_xlsx.py")
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "$(dirname '{log}')"
+        exec > '{log}' 2>&1
+        python '{params.script}' \
+          --alignment-report '{input.alignment_report}' \
+          --count '{input.count_matrix}' \
+          --fpkm '{input.fpkm}' \
+          --tpm '{input.tpm}' \
+          --output '{output.xlsx}'
+        """
