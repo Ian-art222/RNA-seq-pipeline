@@ -188,7 +188,7 @@ r1_suffix：R1 文件后缀（相对子目录名 sample），本账号默认 _1.
 r2_suffix：R2 文件后缀，本账号默认 _2.fastq.gz
 strict：扫描是否严格检查不完整样本目录
 alignment
-mapq_filter：samtools view 的 MAPQ 过滤阈值
+mapq_filter：samtools view 的 MAPQ 过滤阈值，默认 30（普通和链特异性分支均生效）；设为 0 可关闭过滤
 hisat2_extra：传递给 HISAT2 的额外参数
 stringtie
 use_ballgown：是否加 -B
@@ -301,6 +301,7 @@ logs/export_expression_xlsx.log
 ```
 
 ## 10. mapq_filter=30 和 mapq_filter=0 的区别
+当前默认 `mapq_filter: 30`，即在生成 BAM 时保留 MAPQ >= 30 的比对记录。
 mapq_filter = 30
 实际执行：
 samtools view -b -q 30

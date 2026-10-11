@@ -24,7 +24,7 @@ sample_scan:
   r2_suffix: "_2.fastq.gz"
   strict: true
 alignment:
-  mapq_filter: 0
+  mapq_filter: 30
   hisat2_extra: ""
 stringtie:
   use_ballgown: true

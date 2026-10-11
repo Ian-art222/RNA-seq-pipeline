@@ -121,7 +121,7 @@ def get_r1(wc):
 def get_r2(wc):
     return str(CLEAN_DIR / wc.sample / f"{wc.sample}{R2_SUFFIX}")
 def mapq_option():
-    q = int(config["alignment"].get("mapq_filter", 0))
+    q = int(config["alignment"].get("mapq_filter", 30))
     return "" if q <= 0 else f"-q {q}"
 def ballgown_option():
     return "-B" if bool(config["stringtie"].get("use_ballgown", True)) else ""
