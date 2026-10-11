@@ -1,4 +1,73 @@
 # RNA-seq Snakemake Pipeline
+
+## 链特异性定量开关
+
+输入仍为同一参考下的双端 clean FASTQ。运行前设置配置文件中的 `stranded`，或在原运行命令末尾添加 `--config stranded=true` / `--config stranded=false`。省略该字段时默认 `false`，字符串 `false` 也会正确解析；其他取值报错。
+
+- `stranded: false`：HISAT2 → 排序/索引 → StringTie 普通定量 → 原有矩阵与 Excel。
+- `stranded: true`：HISAT2 → 排序/索引 → RSeQC 逐样本判链 → 全样本质量检查 → StringTie `--fr` / `--rf` 定量 → 矩阵与 Excel。
+
+两条路共享不预设链方向的 `HISAT2 --dta` 比对。开启判链时，`alignment.hisat2_extra` 不得包含 `--rna-strandness`；已有 BAM 的 HISAT2 命令记录也会检查。StringTie 的 `--fr` / `--rf` 统一由开关与判链结果管理，不要写入 `stringtie.extra`。每个样本独立判链，所有样本通过且方向一致后才允许任何样本进入链特异性定量。混合建库协议请按协议拆成独立任务。
+
+```yaml
+stranded: true
+strandness:
+  sample_size: 200000
+  mapq: 30
+  min_determinable: 0.50
+  min_dominance: 0.80
+  bed12: ""  # 空值：从 reference.annotation 自动生成
+```
+
+`mode1` 为 `1++,1--,2+-,2-+` 的比例，`mode2` 为 `1+-,1-+,2++,2--` 的比例。保留原判定规则：`mode1 + mode2 >= 0.50` 且 `max(mode1, mode2)/(mode1 + mode2) >= 0.80`；mode1 占优用 `--fr`，mode2 占优用 `--rf`。这是本流程采用的阈值，不是 RSeQC 的通用质量标准。
+
+`-s 200000` 是目标采样量。报告会记录 RSeQC stderr 中实际 usable reads 数；实际数量为零、数量缺失或超出目标时判链失败，正数但不足目标时记录警告，不另加未约定的读数阈值。接近判定边界或可用 reads 很少时，应结合原始报告复核。RSeQC 5.0.4 按 BAM 顺序读取符合条件的记录，不是全基因组随机抽样；两种模式之和也不是全部 reads 的注释率。
+
+### 注释与输入检查
+
+开启链特异性模式后，流程从同一 `reference.annotation` 生成 BED12：GTF 逐转录本使用 exon 坐标；GFF/GFF3 先经 gffread 转为 GTF，保留转换文件和日志。缺少 exon 的模型、无效坐标或不一致的转录本信息会明确报错，避免静默丢失模型。如果设置 `strandness.bed12`，会校验 BED12 并与当前注释的转录本模型核对。注释和 BAM 必须来自同一组装；序列名称、坐标检查通过不能单独证明组装版本相同。
+
+判链前检查 BAM/BAI 可读性、排序信息和 BED12 对 BAM 序列名称/长度的兼容性。RSeQC 必须正常退出、识别为 PairEnd，并完整输出两种比例、无法判定比例和实际采样数；缺失/重复字段、非有限数值或非法范围均失败。`NA`、比例不达标或样本间方向冲突会使质量检查规则以非零状态退出，停止后续 StringTie，不自动改用普通定量。
+
+### 输出位置与重跑
+
+普通模式继续输出到配置的 `paths.quant_dir` 和 `output.xlsx`。链特异性模式自动在两者所属位置增加 `stranded/` 子目录，避免覆盖普通定量结果。默认路径为：
+
+```text
+quantification/stranded/{sample}/{sample}.gtf
+quantification/stranded/{sample}/{sample}_abundance.tab
+quantification/stranded/gene_count_matrix.csv
+quantification/stranded/gene_fpkm_matrix.csv
+quantification/stranded/gene_tpm_matrix.csv
+quantification/stranded/gene_expression_matrices.xlsx
+quantification/stranded/strandness/reference.bed12
+quantification/stranded/strandness/{sample}.json
+quantification/stranded/strandness/strandness.env
+logs/stranded/strandness/prepare_bed.json
+logs/stranded/strandness/{sample}/
+logs/stranded/strandness/strandness_diagnostic.tsv
+logs/stranded/strandness/gate.log
+```
+
+每样本 JSON 记录状态、原始比例、实际/目标采样量、方向、警告和失败原因；日志目录保留命令、版本、RSeQC stdout/stderr。质量检查的 TSV 作为日志保存，失败后仍保留；只有通过才生成 `strandness.env`，StringTie 显式依赖该文件。单样本判链步骤输出诊断记录，即使判链失败也先收集其它样本的结果，最终由质量检查规则阻断定量。
+
+链特异性步骤使用独立的 `workflow/envs/strandness.yaml`（RSeQC 5.0.4、pysam、gffread）；普通模式只需要原来的 `rnaseq.yaml`。继续使用 `--use-conda` 自动管理环境。
+
+修复注释、BAM 或配置后，Snakemake 会按依赖重算。若只修复了运行环境、工具故障，之前的失败 JSON 仍是已完成的诊断文件，需要在原命令中添加 `--forcerun infer_strandness strandness_gate` 重新判链。若旧 BAM 曾以错误或未知的链参数比对，应先核实来源，再按需要显式重跑比对；本升级不会自动重跑用户现有样本。
+
+示例（先检查再正式运行）：
+
+```bash
+snakemake \
+  --snakefile /home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/workflow/Snakefile \
+  --configfile /home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/config/config.yaml \
+  --directory /home/pipeline/2.Snakemake-workdir/1.RNA-seq-workdir \
+  --use-conda --cores 32 --dry-run --printshellcmds \
+  --config stranded=true
+```
+
+检查通过后去掉 `--dry-run` 执行。源码测试使用 `python -m unittest discover -s tests -v`；真实工具集成测试的环境配置见 `tests/test_workflow_integration.py`，本次验证范围与结果见 [tests/VALIDATION.md](tests/VALIDATION.md)。
+
 ## 1. 项目简介
 这是一个基于 Snakemake 的 RNA-seq 表达定量流程，工具固定为：
 - HISAT2
@@ -11,7 +80,7 @@
 3. `samtools view` 转 BAM，并支持可调 `mapq_filter`
 4. `samtools sort`
 5. `samtools index`
-6. `StringTie -e -A` 定量，`-B` 可开关
+6. 按 `stranded` 开关选择普通定量或 RSeQC 判链后定量；StringTie 保持 `-e -A`，`-B` 可开关
 7. 汇总比对 summary，生成 `alignment_report.csv`
 8. `prepDE.py` 生成 raw count matrix
 9. 汇总生成：
@@ -50,11 +119,15 @@
 │   │   ├── build_alignment_report.py
 │   │   ├── build_expression_matrices.py
 │   │   ├── export_expression_xlsx.py
+│   │   ├── prepare_strand_bed.py
+│   │   ├── strandness.py
 │   │   └── prepDE.py
 │   └── envs/
-│       └── rnaseq.yaml
+│       ├── rnaseq.yaml
+│       └── strandness.yaml
 ├── config/
 │   └── config.yaml
+├── tests/
 └── README.md
 ```
 
@@ -90,7 +163,8 @@ cleandata/R_MBS2/R_MBS2_2.fastq.gz
 说明：
 只扫描 cleandata/ 下一级子目录
 子目录名就是 sample 名
-必须同时存在一对 FASTQ 才识别为有效样本
+样本名使用字母、数字、下划线、点或连字符，首字符为字母、数字或下划线
+必须同时存在一对非空 FASTQ 文件才识别为有效样本
 普通文件如 nohup.out 会被忽略
 strict=true 时若发现不完整样本目录，流程会直接报错
 strict=false 时会 warning 并跳过
@@ -170,7 +244,7 @@ conda create -n Snakemake -c conda-forge -c bioconda snakemake
 - 首次运行会在 **workdir** 下生成 `.snakemake/`，并可能耗时创建 `rnaseq` conda 环境缓存。
 - `cleandata`、比对与定量结果、Excel 等均在 workdir 下，**不会**写入源码目录。
 
-1. dry-run（会解析 workflow；首次可能触发创建 `envs/rnaseq.yaml` 对应环境）：
+1. dry-run（检查规则和依赖，不执行分析；环境安装使用下一步命令）：
 
 ```bash
 snakemake \

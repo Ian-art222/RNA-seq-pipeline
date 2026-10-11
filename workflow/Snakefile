@@ -1,6 +1,8 @@
 import os
+import math
+import re
+import shlex
 from pathlib import Path
-
 # 相对路径在 Snakemake 8+ 中默认相对 --directory，故改为相对 Snakefile 所在仓库根目录
 configfile: str(Path(workflow.basedir).resolve().parent / "config" / "config.yaml")
 shell.executable("/bin/bash")
@@ -9,20 +11,61 @@ SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
 def workdir_path(rel: str) -> Path:
     p = Path(rel).expanduser()
     return p if p.is_absolute() else (WORKDIR / p).resolve()
+def parse_stranded(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    raise ValueError("stranded must be true or false (for example: --config stranded=true)")
+
+STRANDED = parse_stranded(config.get("stranded", False))
+STRAND_CONFIG = config.get("strandness", {})
+STRAND_SAMPLE_SIZE = STRAND_CONFIG.get("sample_size", 200000)
+STRAND_MAPQ = STRAND_CONFIG.get("mapq", 30)
+STRAND_MIN_DETERMINABLE = STRAND_CONFIG.get("min_determinable", 0.50)
+STRAND_MIN_DOMINANCE = STRAND_CONFIG.get("min_dominance", 0.80)
+if STRANDED:
+    for name, value, minimum, maximum in [
+        ("sample_size", STRAND_SAMPLE_SIZE, 1, None),
+        ("mapq", STRAND_MAPQ, 0, 255),
+    ]:
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum or (maximum is not None and value > maximum):
+            raise ValueError(f"Invalid strandness.{name}: {value!r}")
+    for name, value, minimum in [
+        ("min_determinable", STRAND_MIN_DETERMINABLE, 0.0),
+        ("min_dominance", STRAND_MIN_DOMINANCE, 0.5),
+    ]:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not minimum < value <= 1:
+            raise ValueError(f"Invalid strandness.{name}: {value!r}")
+    hisat2_tokens = shlex.split(config["alignment"].get("hisat2_extra", ""))
+    if any(token.split("=", 1)[0] == "--rna-strandness" for token in hisat2_tokens):
+        raise ValueError("Automatic strand inference requires unconstrained HISAT2 alignment; remove --rna-strandness from alignment.hisat2_extra.")
+stringtie_tokens = shlex.split(config["stringtie"].get("extra", ""))
+if any(token.split("=", 1)[0] in {"--fr", "--rf"} for token in stringtie_tokens):
+    raise ValueError("Library direction is managed by stranded and RSeQC; remove --fr/--rf from stringtie.extra.")
+
 CLEAN_DIR = workdir_path(config["paths"]["clean_dir"])
 ALIGN_DIR = workdir_path(config["paths"]["align_dir"])
 QUANT_DIR = workdir_path(config["paths"]["quant_dir"])
 LOG_DIR = workdir_path(config["paths"].get("logs_dir", "logs"))
 PREPDE_SCRIPT = SCRIPTS_DIR / "prepDE.py"
 XLSX_OUT = workdir_path(config["output"]["xlsx"])
-HISAT2_INDEX_PREFIX = str(Path(config["reference"]["hisat2_index_prefix"]).expanduser())
-ANNOTATION = str(Path(config["reference"]["annotation"]).expanduser())
+if STRANDED:
+    QUANT_DIR = QUANT_DIR / "stranded"
+    XLSX_OUT = XLSX_OUT.parent / "stranded" / XLSX_OUT.name
+QUANT_LOG_DIR = LOG_DIR / "stranded" if STRANDED else LOG_DIR
+STRAND_QC_DIR = QUANT_DIR / "strandness"
+STRAND_LOG_DIR = QUANT_LOG_DIR / "strandness"
+STRAND_ENV = str(STRAND_QC_DIR / "strandness.env")
+STRAND_SCRIPT = str(SCRIPTS_DIR / "strandness.py")
+BED_SCRIPT = str(SCRIPTS_DIR / "prepare_strand_bed.py")
+STRAND_BED = str(STRAND_QC_DIR / "reference.bed12")
+EXTERNAL_BED = str(workdir_path(STRAND_CONFIG["bed12"])) if STRANDED and STRAND_CONFIG.get("bed12") else ""
+HISAT2_INDEX_PREFIX = str(workdir_path(config["reference"]["hisat2_index_prefix"]))
+ANNOTATION = str(workdir_path(config["reference"]["annotation"]))
 R1_SUFFIX = config["sample_scan"]["r1_suffix"]
 R2_SUFFIX = config["sample_scan"]["r2_suffix"]
 STRICT_SCAN = bool(config["sample_scan"].get("strict", True))
-ALIGN_DIR.mkdir(parents=True, exist_ok=True)
-QUANT_DIR.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
 ALIGN_RULE_THREADS = (
     int(config["threads"]["hisat2"])
     + int(config["threads"]["samtools_view"])
@@ -41,7 +84,9 @@ def discover_samples(clean_dir: Path):
         sample = item.name
         r1 = item / f"{sample}{R1_SUFFIX}"
         r2 = item / f"{sample}{R2_SUFFIX}"
-        if r1.exists() and r2.exists():
+        if r1.is_file() and r2.is_file() and r1.stat().st_size > 0 and r2.stat().st_size > 0:
+            if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", sample):
+                raise ValueError(f"Unsupported sample directory name {sample!r}; use letters, digits, underscores, dots and hyphens, starting with a letter, digit or underscore.")
             samples.append(sample)
         else:
             skipped.append((sample, str(r1), str(r2)))
@@ -50,7 +95,7 @@ def discover_samples(clean_dir: Path):
             [f"  - {sample}\n    missing pair for:\n    {r1}\n    {r2}" for sample, r1, r2 in skipped]
         )
         raise ValueError(
-            "[ERROR] Incomplete sample directories found under clean_dir while strict=true:\n"
+            "[ERROR] Missing, empty or invalid FASTQ pairs under clean_dir while strict=true:\n"
             f"{details}"
         )
     if skipped and not STRICT_SCAN:
@@ -69,6 +114,8 @@ def discover_samples(clean_dir: Path):
         print(f"  - {s}")
     return samples
 SAMPLES = discover_samples(CLEAN_DIR)
+print(f"[INFO] Quantification mode: {'stranded (RSeQC quality gate)' if STRANDED else 'unstranded'}")
+print(f"[INFO] Quantification output: {QUANT_DIR}")
 def get_r1(wc):
     return str(CLEAN_DIR / wc.sample / f"{wc.sample}{R1_SUFFIX}")
 def get_r2(wc):
@@ -140,37 +187,116 @@ rule samtools_index:
         samtools index -@ {threads} '{input.bam}' '{output.bai}'
         echo "[INFO] samtools index finished for sample: {wildcards.sample}"
         """
+if STRANDED:
+    rule prepare_strand_bed:
+        input:
+            annotation=ANNOTATION,
+            external_bed=[EXTERNAL_BED] if EXTERNAL_BED else [],
+            script=BED_SCRIPT
+        output:
+            bed=STRAND_BED
+        log:
+            run=str(STRAND_LOG_DIR / "prepare_bed.log"),
+            report=str(STRAND_LOG_DIR / "prepare_bed.json")
+        params:
+            bed_option=("--bed12 " + shlex.quote(EXTERNAL_BED)) if EXTERNAL_BED else ""
+        conda:
+            "envs/strandness.yaml"
+        shell:
+            r"""
+            mkdir -p "$(dirname {log.run:q})"
+            python {input.script:q} --annotation {input.annotation:q} \
+              --output {output.bed:q} --report {log.report:q} \
+              {params.bed_option} > {log.run:q} 2>&1
+            """
+
+    rule infer_strandness:
+        input:
+            bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam"),
+            bai=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam.bai"),
+            bed=STRAND_BED,
+            script=STRAND_SCRIPT,
+            bed_script=BED_SCRIPT
+        output:
+            report=str(STRAND_QC_DIR / "{sample}.json")
+        log:
+            str(STRAND_LOG_DIR / "{sample}" / "infer.log")
+        params:
+            log_dir=lambda wc: str(STRAND_LOG_DIR / wc.sample),
+            sample_size=STRAND_SAMPLE_SIZE,
+            mapq=STRAND_MAPQ,
+            min_det=STRAND_MIN_DETERMINABLE,
+            min_dom=STRAND_MIN_DOMINANCE
+        threads: 1
+        conda:
+            "envs/strandness.yaml"
+        shell:
+            r"""
+            mkdir -p {params.log_dir:q}
+            python {input.script:q} infer --sample {wildcards.sample:q} \
+              --bam {input.bam:q} --bai {input.bai:q} --bed12 {input.bed:q} \
+              --output {output.report:q} --log-dir {params.log_dir:q} \
+              --sample-size {params.sample_size} --mapq {params.mapq} \
+              --min-determinable {params.min_det} --min-dominance {params.min_dom} \
+              > {log:q} 2>&1
+            """
+
+    rule strandness_gate:
+        input:
+            reports=expand(str(STRAND_QC_DIR / "{sample}.json"), sample=SAMPLES),
+            script=STRAND_SCRIPT
+        output:
+            env=STRAND_ENV
+        log:
+            run=str(STRAND_LOG_DIR / "gate.log"),
+            diagnostic=str(STRAND_LOG_DIR / "strandness_diagnostic.tsv")
+        params:
+            samples=SAMPLES
+        conda:
+            "envs/strandness.yaml"
+        shell:
+            r"""
+            mkdir -p "$(dirname {log.run:q})"
+            python {input.script:q} gate --samples {params.samples:q} \
+              --reports {input.reports:q} --diagnostic {log.diagnostic:q} \
+              --output {output.env:q} > {log.run:q} 2>&1
+            """
+
 rule stringtie_quant:
     input:
         bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam"),
         bai=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam.bai"),
-        annotation=ANNOTATION
+        annotation=ANNOTATION,
+        strand_env=[STRAND_ENV] if STRANDED else [],
+        strand_script=[STRAND_SCRIPT] if STRANDED else []
     output:
         gtf=str(QUANT_DIR / "{sample}" / "{sample}.gtf"),
         abundance=str(QUANT_DIR / "{sample}" / "{sample}_abundance.tab")
     log:
-        str(LOG_DIR / "{sample}" / "stringtie_quant.log")
+        str(QUANT_LOG_DIR / "{sample}" / "stringtie_quant.log")
     params:
         ballgown=ballgown_option(),
         extra=config["stringtie"].get("extra", ""),
-        stringtie_threads=int(config["threads"]["stringtie"])
+        strand_command=("python " + shlex.quote(STRAND_SCRIPT) + " option --env " + shlex.quote(STRAND_ENV)) if STRANDED else "printf ''"
     threads: STRINGTIE_RULE_THREADS
     conda:
         "envs/rnaseq.yaml"
     shell:
         r"""
         set -euo pipefail
-        mkdir -p "$(dirname '{output.gtf}')" "$(dirname '{log}')"
-        exec > '{log}' 2>&1
-        echo "[INFO] StringTie quantification started for sample: {wildcards.sample}"
-        stringtie '{input.bam}' \
-          -G '{input.annotation}' \
-          -p {params.stringtie_threads} \
-          -A '{output.abundance}' \
+        mkdir -p "$(dirname {output.gtf:q})" "$(dirname {log:q})"
+        exec > {log:q} 2>&1
+        strand_option="$({params.strand_command})"
+        echo "[INFO] StringTie strand option: $strand_option"
+        stringtie {input.bam:q} \
+          -G {input.annotation:q} \
+          -p {threads} \
+          -A {output.abundance:q} \
           -e \
+          $strand_option \
           {params.ballgown} \
           {params.extra} \
-          -o '{output.gtf}'
+          -o {output.gtf:q}
         echo "[INFO] StringTie quantification finished for sample: {wildcards.sample}"
         """
 rule build_sample_list:
@@ -179,7 +305,7 @@ rule build_sample_list:
     output:
         str(QUANT_DIR / "sample_lst.txt")
     log:
-        str(LOG_DIR / "build_sample_list.log")
+        str(QUANT_LOG_DIR / "build_sample_list.log")
     run:
         Path(output[0]).parent.mkdir(parents=True, exist_ok=True)
         Path(log[0]).parent.mkdir(parents=True, exist_ok=True)
@@ -217,7 +343,7 @@ rule prepde_raw_counts:
         raw_count=str(QUANT_DIR / "gene_count_matrix.raw.csv"),
         transcript_count=str(QUANT_DIR / "transcript_count_matrix.csv")
     log:
-        str(LOG_DIR / "prepde_raw_counts.log")
+        str(QUANT_LOG_DIR / "prepde_raw_counts.log")
     params:
         prepde=str(PREPDE_SCRIPT),
     conda:
@@ -247,7 +373,7 @@ rule finalize_expression_matrices:
         fpkm=str(QUANT_DIR / "gene_fpkm_matrix.csv"),
         tpm=str(QUANT_DIR / "gene_tpm_matrix.csv")
     log:
-        str(LOG_DIR / "finalize_expression_matrices.log")
+        str(QUANT_LOG_DIR / "finalize_expression_matrices.log")
     params:
         script=str(SCRIPTS_DIR / "build_expression_matrices.py")
     conda:
@@ -274,7 +400,7 @@ rule export_expression_xlsx:
     output:
         xlsx=str(XLSX_OUT)
     log:
-        str(LOG_DIR / "export_expression_xlsx.log")
+        str(QUANT_LOG_DIR / "export_expression_xlsx.log")
     params:
         script=str(SCRIPTS_DIR / "export_expression_xlsx.py")
     conda:

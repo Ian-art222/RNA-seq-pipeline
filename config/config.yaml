@@ -1,3 +1,13 @@
+# false: original unstranded quantification; true: RSeQC-gated stranded quantification.
+# Command-line override: --config stranded=true
+stranded: false
+strandness:
+  sample_size: 200000
+  mapq: 30
+  min_determinable: 0.50
+  min_dominance: 0.80
+  # Optional BED12 from the SAME annotation. Empty: generate from reference.annotation.
+  bed12: ""
 paths:
   clean_dir: "cleandata"
   align_dir: "alignment"
