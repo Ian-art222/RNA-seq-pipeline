@@ -3,6 +3,7 @@
 
 An inference failure is a diagnostic result, not a successful strand call.
 Only ``gate`` creates the file that unlocks downstream quantification.
+``summarize`` reports cohort evidence without gating individual samples.
 """
 
 import argparse
@@ -238,6 +239,18 @@ def infer(args):
             version_command=version_command, version_returncode=version.returncode,
             version_stdout=version.stdout, version_stderr=version.stderr,
         )
+        if re.search(r"\b5\.0\.4\b", report["tool"]["version"]):
+            # Checked against qcmodule.SAM.ParseBAM.configure_experiment in the
+            # pinned RSeQC version. Do not describe these as random read pairs,
+            # or interpret determinable_fraction as a whole-library exon rate.
+            report["sampling"] = {
+                "implementation": "RSeQC 5.0.4 configure_experiment",
+                "selection": "First eligible alignment records in BAM order; not random genome-wide sampling",
+                "unit": "Individual alignment records; paired-end mates are counted separately",
+                "overlap": "BED transcript spans, including introns; exon blocks are not consulted",
+                "read_interval": "Alignment start plus query alignment length; not the full spliced genomic interval",
+                "limitation": "Fractions describe the selected annotation-overlapping records, not all input reads",
+            }
         completed = subprocess.run(command, capture_output=True, text=True, errors="replace", check=False)
         stdout_path.write_text(completed.stdout)
         stderr_path.write_text(completed.stderr)
@@ -277,23 +290,22 @@ def check_report(report):
         raise ValueError("Stored StringTie direction disagrees with the recorded fractions")
 
 
-def gate(args):
-    output = Path(args.output)
-    try:
-        protect_paths(args.reports, [output, args.diagnostic])
-    except (OSError, ValueError) as exc:
-        print("Unsafe gate output paths; no files were changed: {}".format(exc), file=sys.stderr)
-        return 1
-    output.unlink(missing_ok=True)
-    rows, failures, flags, observed = [], [], set(), set()
-    if len(args.samples) != len(set(args.samples)):
-        failures.append("Expected sample IDs are duplicated")
-    if len(args.samples) != len(args.reports):
-        failures.append("Expected sample and report counts differ")
-    for index, sample in enumerate(args.samples):
-        report_path = args.reports[index] if index < len(args.reports) else ""
+def diagnostic_rows(samples, reports):
+    """Distinguish bad evidence from incomplete or incorrectly assigned reports."""
+    rows, failures, structural, flags, observed = [], [], [], set(), set()
+    if len(samples) != len(set(samples)):
+        structural.append("Expected sample IDs are duplicated")
+    if len(samples) != len(reports):
+        structural.append("Expected sample and report counts differ")
+    if not samples:
+        structural.append("No expected samples were provided")
+    for index, sample in enumerate(samples):
+        report_path = reports[index] if index < len(reports) else ""
         row = {"sample": sample, "status": "FAIL", "report": report_path}
+        structure_valid = False
         try:
+            if not sample.strip() or any(char in sample for char in "\t\r\n"):
+                raise ValueError("Sample ID must be nonempty and cannot contain tabs or newlines")
             if not report_path:
                 raise ValueError("Missing report path for expected sample")
             report = json.loads(Path(report_path).read_text())
@@ -307,34 +319,78 @@ def gate(args):
             if sample in observed:
                 raise ValueError("Duplicate sample report")
             observed.add(sample)
+            structure_valid = True
             check_report(report)
             flags.add(report["stringtie_flag"])
             row["status"] = "PASS"
         except Exception as exc:
             row["reason"] = str(exc)
             failures.append("{}: {}".format(sample, exc))
+            if not structure_valid:
+                structural.append("{}: {}".format(sample, exc))
         rows.append(row)
-    if len(flags) > 1:
-        failures.append("Samples disagree on strand direction; expected one shared library protocol")
-        for row in rows:
-            if row["status"] == "PASS":
-                row.update(status="FAIL", reason="Sample directions disagree across the cohort")
-    if not rows:
-        failures.append("No expected samples were provided")
-    if failures:
-        rows.append({"sample": "__gate__", "status": "FAIL", "reason": "; ".join(failures)})
-    diagnostic = Path(args.diagnostic)
+    return rows, failures, structural, flags
+
+
+def write_diagnostic(path, rows):
+    diagnostic = Path(path)
     diagnostic.parent.mkdir(parents=True, exist_ok=True)
     fields = ["sample", "status", "mode1", "mode2", "failed_fraction", "determinable_fraction", "dominant_fraction", "usable_reads", "requested_reads", "stringtie_flag", "warnings", "reason", "report"]
     with diagnostic.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def gate(args):
+    output = Path(args.output)
+    try:
+        protect_paths(args.reports, [output, args.diagnostic])
+    except (OSError, ValueError) as exc:
+        print("Unsafe gate output paths; no files were changed: {}".format(exc), file=sys.stderr)
+        return 1
+    output.unlink(missing_ok=True)
+    rows, failures, structural, flags = diagnostic_rows(args.samples, args.reports)
+    failures = list(dict.fromkeys(structural + failures))
+    if len(flags) > 1:
+        failures.append("Samples disagree on strand direction; expected one shared library protocol")
+        for row in rows:
+            if row["status"] == "PASS":
+                row.update(status="FAIL", reason="Sample directions disagree across the cohort")
     if failures:
-        print("Stranded quantification blocked. See {}: {}".format(diagnostic, "; ".join(failures)), file=sys.stderr)
+        rows.append({"sample": "__gate__", "status": "FAIL", "reason": "; ".join(failures)})
+    write_diagnostic(args.diagnostic, rows)
+    if failures:
+        print("Stranded quantification blocked. See {}: {}".format(args.diagnostic, "; ".join(failures)), file=sys.stderr)
         return 1
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("STRINGTIE_STRAND={}\n".format(next(iter(flags))))
+    return 0
+
+
+def summarize(args):
+    """Report failures and mixed protocols without creating a quantification gate.
+
+    Failed or invalid strand evidence produces a FAIL row and a warning, with
+    exit status zero. Missing/corrupt reports, incorrect sample assignments,
+    duplicate IDs and count mismatches write diagnostics but return one.
+    """
+    try:
+        protect_paths(args.reports, [args.diagnostic])
+    except (OSError, ValueError) as exc:
+        print("Unsafe summary output paths; no files were changed: {}".format(exc), file=sys.stderr)
+        return 1
+    rows, failures, structural, flags = diagnostic_rows(args.samples, args.reports)
+    if structural:
+        rows.append({"sample": "__summary__", "status": "FAIL", "reason": "; ".join(structural)})
+    write_diagnostic(args.diagnostic, rows)
+    if len(flags) > 1:
+        print("WARNING: Samples have mixed FR/RF strand directions. Each passing sample uses its own inferred StringTie direction; verify the library protocols and sample metadata. See {}".format(args.diagnostic), file=sys.stderr)
+    if failures:
+        print("WARNING: Failed strand evidence is recorded in {}. Only the corresponding per-sample gates block quantification: {}".format(args.diagnostic, "; ".join(failures)), file=sys.stderr)
+    if structural:
+        print("Incomplete strand summary in {}: {}".format(args.diagnostic, "; ".join(structural)), file=sys.stderr)
+        return 1
     return 0
 
 
@@ -368,6 +424,11 @@ def main():
     gating.add_argument("--diagnostic", required=True)
     gating.add_argument("--output", required=True)
     gating.set_defaults(func=gate)
+    summary = commands.add_parser("summarize")
+    summary.add_argument("--samples", nargs="+", required=True)
+    summary.add_argument("--reports", nargs="+", required=True)
+    summary.add_argument("--diagnostic", required=True)
+    summary.set_defaults(func=summarize)
     selection = commands.add_parser("option")
     selection.add_argument("--env", required=True)
     selection.set_defaults(func=option)

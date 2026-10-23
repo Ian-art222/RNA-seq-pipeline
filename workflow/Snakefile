@@ -2,21 +2,45 @@ import os
 import math
 import re
 import shlex
+import sys
 from pathlib import Path
-# 相对路径在 Snakemake 8+ 中默认相对 --directory，故改为相对 Snakefile 所在仓库根目录
-configfile: str(Path(workflow.basedir).resolve().parent / "config" / "config.yaml")
+configfile: str(Path(workflow.basedir).parent / "config" / "config.yaml")
 shell.executable("/bin/bash")
 WORKDIR = Path(workflow.workdir_init).resolve()
 SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+sys.path.insert(0, str(SCRIPTS_DIR))
+from align_reads import extra_arguments, extra_input_files
+from workflow_options import stringtie_arguments, protect_inputs
 def workdir_path(rel: str) -> Path:
     p = Path(rel).expanduser()
     return p if p.is_absolute() else (WORKDIR / p).resolve()
-def parse_stranded(value):
+def parse_stranded(value, label="stranded"):
     if isinstance(value, bool):
         return value
     if isinstance(value, str) and value.lower() in {"true", "false"}:
         return value.lower() == "true"
-    raise ValueError("stranded must be true or false (for example: --config stranded=true)")
+    raise ValueError(f"{label} must be true or false (for example: --config {label}=true)")
+
+FASTP_CONFIG = config.get("fastp", {})
+if not isinstance(FASTP_CONFIG, dict):
+    raise ValueError("fastp must be a mapping with enabled and trim_poly_g settings")
+FASTP_ENABLED = parse_stranded(FASTP_CONFIG.get("enabled", False), "fastp.enabled")
+FASTP_TRIM_POLY_G = parse_stranded(FASTP_CONFIG.get("trim_poly_g", False), "fastp.trim_poly_g")
+FASTP_PARAMETERS = {
+    "qualified_quality_phred": FASTP_CONFIG.get("qualified_quality_phred", 20),
+    "unqualified_percent_limit": FASTP_CONFIG.get("unqualified_percent_limit", 30),
+    "n_base_limit": FASTP_CONFIG.get("n_base_limit", 5),
+    "length_required": FASTP_CONFIG.get("length_required", 40),
+}
+for name, minimum, maximum in [
+    ("qualified_quality_phred", 0, 93),
+    ("unqualified_percent_limit", 0, 100),
+    ("n_base_limit", 0, 50),
+    ("length_required", 1, None),
+]:
+    value = FASTP_PARAMETERS[name]
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum or (maximum is not None and value > maximum):
+        raise ValueError(f"Invalid fastp.{name}: {value!r}")
 
 STRANDED = parse_stranded(config.get("stranded", False))
 STRAND_CONFIG = config.get("strandness", {})
@@ -40,11 +64,16 @@ if STRANDED:
     hisat2_tokens = shlex.split(config["alignment"].get("hisat2_extra", ""))
     if any(token.split("=", 1)[0] == "--rna-strandness" for token in hisat2_tokens):
         raise ValueError("Automatic strand inference requires unconstrained HISAT2 alignment; remove --rna-strandness from alignment.hisat2_extra.")
-stringtie_tokens = shlex.split(config["stringtie"].get("extra", ""))
-if any(token.split("=", 1)[0] in {"--fr", "--rf"} for token in stringtie_tokens):
-    raise ValueError("Library direction is managed by stranded and RSeQC; remove --fr/--rf from stringtie.extra.")
+HISAT_EXTRA_TOKENS = extra_arguments(config["alignment"].get("hisat2_extra", ""))
+HISAT_EXTRA_INPUTS = extra_input_files(HISAT_EXTRA_TOKENS, WORKDIR)
+stringtie_tokens, STRINGTIE_EXTRA_INPUTS = stringtie_arguments(config["stringtie"].get("extra", ""), WORKDIR)
 
 CLEAN_DIR = workdir_path(config["paths"]["clean_dir"])
+RAW_DIR = workdir_path(config["paths"].get("raw_dir", "rawdata"))
+FASTP_QC_DIR = workdir_path(config["paths"].get("qc_dir", "qc/fastp"))
+FASTP_SCRIPT = str(SCRIPTS_DIR / "run_fastp.py")
+FASTP_HTML = str(FASTP_QC_DIR / "{sample}" / "{sample}.fastp.html")
+FASTP_JSON = str(FASTP_QC_DIR / "{sample}" / "{sample}.fastp.json")
 ALIGN_DIR = workdir_path(config["paths"]["align_dir"])
 QUANT_DIR = workdir_path(config["paths"]["quant_dir"])
 LOG_DIR = workdir_path(config["paths"].get("logs_dir", "logs"))
@@ -56,49 +85,81 @@ if STRANDED:
 QUANT_LOG_DIR = LOG_DIR / "stranded" if STRANDED else LOG_DIR
 STRAND_QC_DIR = QUANT_DIR / "strandness"
 STRAND_LOG_DIR = QUANT_LOG_DIR / "strandness"
-STRAND_ENV = str(STRAND_QC_DIR / "strandness.env")
+STRAND_ENV = str(STRAND_QC_DIR / "{sample}.env")
+STRAND_DIAGNOSTIC = str(STRAND_LOG_DIR / "strandness_diagnostic.tsv")
 STRAND_SCRIPT = str(SCRIPTS_DIR / "strandness.py")
 BED_SCRIPT = str(SCRIPTS_DIR / "prepare_strand_bed.py")
-STRAND_BED = str(STRAND_QC_DIR / "reference.bed12")
+REFERENCE_DIR = QUANT_DIR / "reference"
+STRAND_BED = str(REFERENCE_DIR / "reference.bed12")
+NORMALIZED_GTF = str(REFERENCE_DIR / "reference.gtf")
+READ_LENGTH_SCRIPT = str(SCRIPTS_DIR / "read_lengths.py")
+READ_LENGTH_REPORT = str(ALIGN_DIR / "read_lengths" / "{sample}.json")
+READ_LENGTHS = str(ALIGN_DIR / "read_lengths.json")
+BAM_VALIDATION = str(REFERENCE_DIR / "bam_validation" / "{sample}.json")
 EXTERNAL_BED = str(workdir_path(STRAND_CONFIG["bed12"])) if STRANDED and STRAND_CONFIG.get("bed12") else ""
 HISAT2_INDEX_PREFIX = str(workdir_path(config["reference"]["hisat2_index_prefix"]))
 ANNOTATION = str(workdir_path(config["reference"]["annotation"]))
 R1_SUFFIX = config["sample_scan"]["r1_suffix"]
 R2_SUFFIX = config["sample_scan"]["r2_suffix"]
-STRICT_SCAN = bool(config["sample_scan"].get("strict", True))
+STRICT_SCAN = parse_stranded(config["sample_scan"].get("strict", True), "sample_scan.strict")
+USE_BALLGOWN = parse_stranded(config["stringtie"].get("use_ballgown", True), "stringtie.use_ballgown")
+def validate_suffixes(r1_suffix, r2_suffix, label):
+    for value in (r1_suffix, r2_suffix):
+        if not isinstance(value, str) or not value or re.search(r"[/\\*?\[\]{}\x00-\x1f]", value):
+            raise ValueError(f"{label} R1/R2 suffixes must be nonempty filename suffixes without path separators, wildcards, braces or control characters")
+    if r1_suffix == r2_suffix:
+        raise ValueError(f"{label} R1/R2 suffixes must be distinct")
+validate_suffixes(R1_SUFFIX, R2_SUFFIX, "sample_scan")
+RAW_SCAN = config.get("raw_sample_scan", {})
+if not isinstance(RAW_SCAN, dict):
+    raise ValueError("raw_sample_scan must be a mapping with R1/R2 suffixes and strict settings")
+RAW_R1_SUFFIX = RAW_SCAN.get("r1_suffix", "_1.fastq.gz")
+RAW_R2_SUFFIX = RAW_SCAN.get("r2_suffix", "_2.fastq.gz")
+RAW_STRICT_SCAN = parse_stranded(RAW_SCAN.get("strict", True), "raw_sample_scan.strict")
+validate_suffixes(RAW_R1_SUFFIX, RAW_R2_SUFFIX, "raw_sample_scan")
+for name, value in config["threads"].items():
+    minimum = 0 if name in {"samtools_view", "samtools_sort"} else 1
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"Invalid threads.{name}: {value!r}")
+MAPQ = config["alignment"].get("mapq_filter", 0)
+if isinstance(MAPQ, bool) or not isinstance(MAPQ, int) or not 0 <= MAPQ <= 255:
+    raise ValueError("alignment.mapq_filter must be an integer in [0,255]")
 ALIGN_RULE_THREADS = (
     int(config["threads"]["hisat2"])
     + int(config["threads"]["samtools_view"])
     + int(config["threads"]["samtools_sort"])
+    + 2  # samtools -@ specifies additional threads; each process also has a main thread.
 )
 INDEX_RULE_THREADS = int(config["threads"]["samtools_index"])
 STRINGTIE_RULE_THREADS = int(config["threads"]["stringtie"])
-def discover_samples(clean_dir: Path):
+FASTP_RULE_THREADS = config["threads"].get("fastp", 8)
+
+def discover_samples(source_dir: Path, r1_suffix, r2_suffix, strict, label):
     samples = []
     skipped = []
-    if not clean_dir.exists():
-        raise ValueError(f"[ERROR] clean_dir does not exist: {clean_dir}")
-    for item in sorted(clean_dir.iterdir()):
+    if not source_dir.is_dir():
+        raise ValueError(f"[ERROR] {label} does not exist or is not a directory: {source_dir}")
+    for item in sorted(source_dir.iterdir()):
         if not item.is_dir():
             continue
         sample = item.name
-        r1 = item / f"{sample}{R1_SUFFIX}"
-        r2 = item / f"{sample}{R2_SUFFIX}"
+        r1 = item / f"{sample}{r1_suffix}"
+        r2 = item / f"{sample}{r2_suffix}"
         if r1.is_file() and r2.is_file() and r1.stat().st_size > 0 and r2.stat().st_size > 0:
             if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", sample):
                 raise ValueError(f"Unsupported sample directory name {sample!r}; use letters, digits, underscores, dots and hyphens, starting with a letter, digit or underscore.")
             samples.append(sample)
         else:
             skipped.append((sample, str(r1), str(r2)))
-    if skipped and STRICT_SCAN:
+    if skipped and strict:
         details = "\n".join(
             [f"  - {sample}\n    missing pair for:\n    {r1}\n    {r2}" for sample, r1, r2 in skipped]
         )
         raise ValueError(
-            "[ERROR] Missing, empty or invalid FASTQ pairs under clean_dir while strict=true:\n"
+            f"[ERROR] Missing, empty or invalid FASTQ pairs under {label} while strict=true:\n"
             f"{details}"
         )
-    if skipped and not STRICT_SCAN:
+    if skipped and not strict:
         print("[WARN] Incomplete sample directories skipped because strict=false:")
         for sample, r1, r2 in skipped:
             print(f"  - {sample}")
@@ -106,36 +167,183 @@ def discover_samples(clean_dir: Path):
             print(f"    expected: {r2}")
     if not samples:
         raise ValueError(
-            f"[ERROR] No valid samples found under {clean_dir}. "
-            f"Expected structure: cleandata/{{sample}}/{{sample}}{R1_SUFFIX} and {R2_SUFFIX}"
+            f"[ERROR] No valid samples found under {source_dir}. "
+            f"Expected structure: {source_dir}/{{sample}}/{{sample}}{r1_suffix} and {r2_suffix}"
         )
     print(f"[INFO] Discovered {len(samples)} samples:")
     for s in samples:
         print(f"  - {s}")
     return samples
-SAMPLES = discover_samples(CLEAN_DIR)
+if FASTP_ENABLED:
+    SAMPLES = discover_samples(RAW_DIR, RAW_R1_SUFFIX, RAW_R2_SUFFIX, RAW_STRICT_SCAN, "raw_dir")
+else:
+    SAMPLES = discover_samples(CLEAN_DIR, R1_SUFFIX, R2_SUFFIX, STRICT_SCAN, "clean_dir")
+print(f"[INFO] Input mode: {'raw FASTQ -> fastp -> clean FASTQ' if FASTP_ENABLED else 'existing clean FASTQ'}")
+if FASTP_ENABLED:
+    print(f"[INFO] fastp polyG trimming: {'enabled' if FASTP_TRIM_POLY_G else 'explicitly disabled'}")
 print(f"[INFO] Quantification mode: {'stranded (RSeQC quality gate)' if STRANDED else 'unstranded'}")
 print(f"[INFO] Quantification output: {QUANT_DIR}")
 def get_r1(wc):
     return str(CLEAN_DIR / wc.sample / f"{wc.sample}{R1_SUFFIX}")
 def get_r2(wc):
     return str(CLEAN_DIR / wc.sample / f"{wc.sample}{R2_SUFFIX}")
-def mapq_option():
-    q = int(config["alignment"].get("mapq_filter", 30))
-    return "" if q <= 0 else f"-q {q}"
-def ballgown_option():
-    return "-B" if bool(config["stringtie"].get("use_ballgown", True)) else ""
+def get_raw_r1(wc):
+    return str(RAW_DIR / wc.sample / f"{wc.sample}{RAW_R1_SUFFIX}")
+def get_raw_r2(wc):
+    return str(RAW_DIR / wc.sample / f"{wc.sample}{RAW_R2_SUFFIX}")
+
+def overlap(path1, path2):
+    left, right = Path(path1).resolve(), Path(path2).resolve()
+    return left == right or left in right.parents or right in left.parents
+
+if FASTP_ENABLED:
+    roots = {"raw_dir": RAW_DIR, "clean_dir": CLEAN_DIR, "qc_dir": FASTP_QC_DIR}
+    for left, right in (("raw_dir", "clean_dir"), ("raw_dir", "qc_dir"), ("clean_dir", "qc_dir")):
+        if overlap(roots[left], roots[right]):
+            raise ValueError(f"fastp requires disjoint {left} and {right}; overlapping directories could overwrite inputs or outputs")
+    for label, directory in (("align_dir", ALIGN_DIR), ("quant_dir", QUANT_DIR), ("logs_dir", LOG_DIR)):
+        if overlap(RAW_DIR, directory):
+            raise ValueError(f"fastp raw_dir and {label} must not overlap; raw FASTQ inputs must remain unchanged")
+    if RAW_DIR.resolve() in XLSX_OUT.resolve().parents or RAW_DIR.resolve() == XLSX_OUT.resolve():
+        raise ValueError("output.xlsx must not be inside raw_dir")
+    raw_paths, raw_inodes = set(), set()
+    raw_directories = {RAW_DIR.resolve()}
+    for sample in SAMPLES:
+        pair = [RAW_DIR / sample / f"{sample}{suffix}" for suffix in (RAW_R1_SUFFIX, RAW_R2_SUFFIX)]
+        if pair[0].samefile(pair[1]):
+            raise ValueError(f"Raw FASTQ mates must be different files: {sample}")
+        for path in pair:
+            raw_paths.add(path.resolve())
+            raw_directories.add(path.resolve().parent)
+            stat = path.stat()
+            raw_inodes.add((stat.st_dev, stat.st_ino))
+    output_paths, output_inodes = set(), set()
+    for sample in SAMPLES:
+        files = [CLEAN_DIR / sample / f"{sample}{suffix}" for suffix in (R1_SUFFIX, R2_SUFFIX)]
+        files += [FASTP_QC_DIR / sample / f"{sample}.fastp.{extension}" for extension in ("html", "json")]
+        files += [LOG_DIR / sample / "fastp.log"]
+        for path in files:
+            resolved = path.resolve()
+            if any(part in str(path) for part in ("{", "}", "\n", "\r")):
+                raise ValueError(f"fastp output paths cannot contain braces or line breaks: {path}")
+            if resolved in raw_paths or resolved in output_paths:
+                raise ValueError(f"fastp input/output paths overlap: {path}")
+            if any(directory == resolved or directory in resolved.parents for directory in raw_directories):
+                raise ValueError(f"fastp output resolves inside a raw input directory: {path}")
+            if path.exists():
+                if not path.is_file():
+                    raise ValueError(f"fastp output is not a regular file: {path}")
+                stat = path.stat()
+                inode = (stat.st_dev, stat.st_ino)
+                if inode in raw_inodes or inode in output_inodes:
+                    raise ValueError(f"fastp input/output files are linked to the same file: {path}")
+                output_inodes.add(inode)
+            output_paths.add(resolved)
+
+def index_files(prefix):
+    sets = [[f"{prefix}.{i}.{extension}" for i in range(1, 9)] for extension in ("ht2", "ht2l")]
+    present = [[path for path in group if Path(path).is_file() and Path(path).stat().st_size > 0] for group in sets]
+    complete = [group for group, exists in zip(sets, present) if len(exists) == 8]
+    if len(complete) != 1 or all(present):
+        raise ValueError(f"Expected exactly one complete, nonempty set of 8 .ht2 or .ht2l HISAT2 index files at {prefix}; found {[len(group) for group in present]}. Check reference.hisat2_index_prefix.")
+    return complete[0]
+
+HISAT2_INDEX_FILES = index_files(HISAT2_INDEX_PREFIX)
+if not Path(ANNOTATION).is_file() or not Path(ANNOTATION).stat().st_size:
+    raise ValueError(f"Reference annotation is missing or empty: {ANNOTATION}; set reference.annotation")
+BALLGOWN_NAMES = ["e2t.ctab", "e_data.ctab", "i2t.ctab", "i_data.ctab", "t_data.ctab"] if USE_BALLGOWN else []
+BALLGOWN_OUTPUTS = [str(QUANT_DIR / "{sample}" / name) for name in BALLGOWN_NAMES]
+
 rule all:
     input:
         str(ALIGN_DIR / "alignment_report.csv"),
         str(QUANT_DIR / "gene_count_matrix.csv"),
         str(QUANT_DIR / "gene_fpkm_matrix.csv"),
         str(QUANT_DIR / "gene_tpm_matrix.csv"),
-        str(XLSX_OUT)
+        str(XLSX_OUT),
+        expand(BALLGOWN_OUTPUTS, sample=SAMPLES),
+        expand([FASTP_HTML, FASTP_JSON], sample=SAMPLES) if FASTP_ENABLED else [],
+        [STRAND_DIAGNOSTIC] if STRANDED else []
+
+if FASTP_ENABLED:
+    rule fastp_clean:
+        input:
+            r1=get_raw_r1,
+            r2=get_raw_r2,
+            script=FASTP_SCRIPT,
+            read_length_script=READ_LENGTH_SCRIPT
+        output:
+            r1=str(CLEAN_DIR / "{sample}" / ("{sample}" + R1_SUFFIX)),
+            r2=str(CLEAN_DIR / "{sample}" / ("{sample}" + R2_SUFFIX)),
+            html=FASTP_HTML,
+            json=FASTP_JSON
+        params:
+            trim_poly_g=str(FASTP_TRIM_POLY_G).lower(),
+            qualified_quality_phred=FASTP_PARAMETERS["qualified_quality_phred"],
+            unqualified_percent_limit=FASTP_PARAMETERS["unqualified_percent_limit"],
+            n_base_limit=FASTP_PARAMETERS["n_base_limit"],
+            length_required=FASTP_PARAMETERS["length_required"]
+        log:
+            str(LOG_DIR / "{sample}" / "fastp.log")
+        threads: FASTP_RULE_THREADS
+        conda:
+            "envs/fastp.yaml"
+        shell:
+            r"""
+            mkdir -p "$(dirname {log:q})"
+            python {input.script:q} --sample {wildcards.sample:q} \
+              --r1 {input.r1:q} --r2 {input.r2:q} \
+              --out-r1 {output.r1:q} --out-r2 {output.r2:q} \
+              --html {output.html:q} --json {output.json:q} --threads {threads} \
+              --trim-poly-g {params.trim_poly_g:q} \
+              --qualified-quality-phred {params.qualified_quality_phred} \
+              --unqualified-percent-limit {params.unqualified_percent_limit} \
+              --n-base-limit {params.n_base_limit} --length-required {params.length_required} \
+              > {log:q} 2>&1
+            """
+
+rule measure_read_lengths:
+    input:
+        r1=get_r1, r2=get_r2, script=READ_LENGTH_SCRIPT
+    output:
+        report=READ_LENGTH_REPORT
+    log:
+        str(LOG_DIR / "{sample}" / "read_lengths.log")
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        mkdir -p "$(dirname {log:q})"
+        python {input.script:q} measure --sample {wildcards.sample:q} \
+          --r1 {input.r1:q} --r2 {input.r2:q} --output {output.report:q} > {log:q} 2>&1
+        """
+
+rule collect_read_lengths:
+    input:
+        reports=expand(READ_LENGTH_REPORT, sample=SAMPLES), script=READ_LENGTH_SCRIPT
+    output:
+        lengths=READ_LENGTHS
+    params:
+        samples=SAMPLES
+    log:
+        str(LOG_DIR / "collect_read_lengths.log")
+    conda:
+        "envs/rnaseq.yaml"
+    shell:
+        r"""
+        mkdir -p "$(dirname {log:q})"
+        python {input.script:q} combine --samples {params.samples:q} \
+          --reports {input.reports:q} --output {output.lengths:q} > {log:q} 2>&1
+        """
+
 rule hisat2_align_sort:
     input:
         r1=get_r1,
-        r2=get_r2
+        r2=get_r2,
+        read_lengths=READ_LENGTH_REPORT,
+        index_files=HISAT2_INDEX_FILES,
+        splice_inputs=HISAT_EXTRA_INPUTS,
+        script=str(SCRIPTS_DIR / "align_reads.py")
     output:
         bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam"),
         summary=str(ALIGN_DIR / "{sample}" / "{sample}.align_summary.txt")
@@ -144,7 +352,7 @@ rule hisat2_align_sort:
     params:
         index=HISAT2_INDEX_PREFIX,
         hisat2_extra=config["alignment"].get("hisat2_extra", ""),
-        mapq=mapq_option(),
+        mapq=MAPQ,
         hisat2_threads=int(config["threads"]["hisat2"]),
         view_threads=int(config["threads"]["samtools_view"]),
         sort_threads=int(config["threads"]["samtools_sort"])
@@ -153,20 +361,12 @@ rule hisat2_align_sort:
         "envs/rnaseq.yaml"
     shell:
         r"""
-        set -euo pipefail
-        mkdir -p "$(dirname '{output.bam}')" "$(dirname '{log}')"
-        exec 2> '{log}'
-        echo "[INFO] HISAT2 + samtools alignment started for sample: {wildcards.sample}" >&2
-        hisat2 --dta \
-          --summary-file '{output.summary}' \
-          -p {params.hisat2_threads} \
-          {params.hisat2_extra} \
-          -x '{params.index}' \
-          -1 '{input.r1}' \
-          -2 '{input.r2}' \
-        | samtools view -b {params.mapq} -@ {params.view_threads} - \
-        | samtools sort -@ {params.sort_threads} -o '{output.bam}' -
-        echo "[INFO] HISAT2 + samtools alignment finished for sample: {wildcards.sample}" >&2
+        mkdir -p "$(dirname {log:q})"
+        python {input.script:q} --r1 {input.r1:q} --r2 {input.r2:q} \
+          --index {params.index:q} --bam {output.bam:q} --summary {output.summary:q} \
+          --threads {threads} --hisat2-threads {params.hisat2_threads} \
+          --view-threads {params.view_threads} --sort-threads {params.sort_threads} \
+          --mapq {params.mapq} --hisat2-extra={params.hisat2_extra:q} > {log:q} 2>&1
         """
 rule samtools_index:
     input:
@@ -176,40 +376,64 @@ rule samtools_index:
     log:
         str(LOG_DIR / "{sample}" / "samtools_index.log")
     threads: INDEX_RULE_THREADS
+    params:
+        extra_threads=lambda wildcards, threads: max(0, threads - 1)
     conda:
         "envs/rnaseq.yaml"
     shell:
         r"""
         set -euo pipefail
-        mkdir -p "$(dirname '{log}')"
-        exec > '{log}' 2>&1
+        mkdir -p "$(dirname {log:q})"
+        exec > {log:q} 2>&1
         echo "[INFO] samtools index started for sample: {wildcards.sample}"
-        samtools index -@ {threads} '{input.bam}' '{output.bai}'
+        samtools index -@ {params.extra_threads} {input.bam:q} {output.bai:q}
         echo "[INFO] samtools index finished for sample: {wildcards.sample}"
         """
-if STRANDED:
-    rule prepare_strand_bed:
-        input:
-            annotation=ANNOTATION,
-            external_bed=[EXTERNAL_BED] if EXTERNAL_BED else [],
-            script=BED_SCRIPT
-        output:
-            bed=STRAND_BED
-        log:
-            run=str(STRAND_LOG_DIR / "prepare_bed.log"),
-            report=str(STRAND_LOG_DIR / "prepare_bed.json")
-        params:
-            bed_option=("--bed12 " + shlex.quote(EXTERNAL_BED)) if EXTERNAL_BED else ""
-        conda:
-            "envs/strandness.yaml"
-        shell:
-            r"""
-            mkdir -p "$(dirname {log.run:q})"
-            python {input.script:q} --annotation {input.annotation:q} \
-              --output {output.bed:q} --report {log.report:q} \
-              {params.bed_option} > {log.run:q} 2>&1
-            """
+rule prepare_reference:
+    input:
+        annotation=ANNOTATION,
+        external_bed=[EXTERNAL_BED] if EXTERNAL_BED else [],
+        script=BED_SCRIPT
+    output:
+        bed=STRAND_BED,
+        gtf=NORMALIZED_GTF
+    log:
+        run=str(QUANT_LOG_DIR / "reference" / "prepare_bed.log"),
+        report=str(QUANT_LOG_DIR / "reference" / "prepare_bed.json")
+    params:
+        bed_option=("--bed12 " + shlex.quote(EXTERNAL_BED)) if EXTERNAL_BED else ""
+    conda:
+        "envs/strandness.yaml"
+    shell:
+        r"""
+        mkdir -p "$(dirname {log.run:q})"
+        python {input.script:q} --annotation {input.annotation:q} \
+          --output {output.bed:q} --normalized-gtf {output.gtf:q} --report {log.report:q} \
+          {params.bed_option} > {log.run:q} 2>&1
+        """
 
+
+rule validate_bam_reference:
+    input:
+        bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam"),
+        bai=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam.bai"),
+        bed=STRAND_BED,
+        script=str(SCRIPTS_DIR / "validate_bam_reference.py"),
+        bed_script=BED_SCRIPT
+    output:
+        report=BAM_VALIDATION
+    log:
+        str(QUANT_LOG_DIR / "{sample}" / "validate_bam_reference.log")
+    conda:
+        "envs/strandness.yaml"
+    shell:
+        r"""
+        mkdir -p "$(dirname {log:q})"
+        python {input.script:q} --bam {input.bam:q} --bai {input.bai:q} \
+          --bed12 {input.bed:q} --output {output.report:q} > {log:q} 2>&1
+        """
+
+if STRANDED:
     rule infer_strandness:
         input:
             bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam"),
@@ -243,41 +467,64 @@ if STRANDED:
 
     rule strandness_gate:
         input:
-            reports=expand(str(STRAND_QC_DIR / "{sample}.json"), sample=SAMPLES),
+            report=str(STRAND_QC_DIR / "{sample}.json"),
             script=STRAND_SCRIPT
         output:
             env=STRAND_ENV
         log:
-            run=str(STRAND_LOG_DIR / "gate.log"),
-            diagnostic=str(STRAND_LOG_DIR / "strandness_diagnostic.tsv")
+            run=str(STRAND_LOG_DIR / "{sample}" / "gate.log"),
+            diagnostic=str(STRAND_LOG_DIR / "{sample}" / "strandness_diagnostic.tsv")
+        conda:
+            "envs/strandness.yaml"
+        shell:
+            r"""
+            mkdir -p "$(dirname {log.run:q})"
+            python {input.script:q} gate --samples {wildcards.sample:q} \
+              --reports {input.report:q} --diagnostic {log.diagnostic:q} \
+              --output {output.env:q} > {log.run:q} 2>&1
+            """
+
+    # Cohort reporting is a terminal branch, never a dependency of a sample's
+    # quantification. Each sample uses only its own validated strand direction.
+    rule summarize_strandness:
+        input:
+            reports=expand(str(STRAND_QC_DIR / "{sample}.json"), sample=SAMPLES),
+            script=STRAND_SCRIPT
+        output:
+            diagnostic=STRAND_DIAGNOSTIC
+        log:
+            str(STRAND_LOG_DIR / "summarize.log")
         params:
             samples=SAMPLES
         conda:
             "envs/strandness.yaml"
         shell:
             r"""
-            mkdir -p "$(dirname {log.run:q})"
-            python {input.script:q} gate --samples {params.samples:q} \
-              --reports {input.reports:q} --diagnostic {log.diagnostic:q} \
-              --output {output.env:q} > {log.run:q} 2>&1
+            mkdir -p "$(dirname {log:q})"
+            python {input.script:q} summarize --samples {params.samples:q} \
+              --reports {input.reports:q} --diagnostic {output.diagnostic:q} > {log:q} 2>&1
             """
 
 rule stringtie_quant:
     input:
         bam=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam"),
         bai=str(ALIGN_DIR / "{sample}" / "{sample}.sorted.bam.bai"),
-        annotation=ANNOTATION,
+        annotation=NORMALIZED_GTF,
+        validation=BAM_VALIDATION,
+        extra_inputs=STRINGTIE_EXTRA_INPUTS,
+        options_script=str(SCRIPTS_DIR / "workflow_options.py"),
         strand_env=[STRAND_ENV] if STRANDED else [],
         strand_script=[STRAND_SCRIPT] if STRANDED else []
     output:
         gtf=str(QUANT_DIR / "{sample}" / "{sample}.gtf"),
-        abundance=str(QUANT_DIR / "{sample}" / "{sample}_abundance.tab")
+        abundance=str(QUANT_DIR / "{sample}" / "{sample}_abundance.tab"),
+        ballgown=BALLGOWN_OUTPUTS
     log:
         str(QUANT_LOG_DIR / "{sample}" / "stringtie_quant.log")
     params:
-        ballgown=ballgown_option(),
-        extra=config["stringtie"].get("extra", ""),
-        strand_command=("python " + shlex.quote(STRAND_SCRIPT) + " option --env " + shlex.quote(STRAND_ENV)) if STRANDED else "printf ''"
+        ballgown="-B" if USE_BALLGOWN else "",
+        extra=shlex.join(stringtie_tokens),
+        strand_command=lambda wildcards, input: ("python " + shlex.quote(STRAND_SCRIPT) + " option --env " + shlex.quote(str(input.strand_env[0]))) if STRANDED else "printf ''"
     threads: STRINGTIE_RULE_THREADS
     conda:
         "envs/rnaseq.yaml"
@@ -317,57 +564,57 @@ rule build_sample_list:
             lf.write(f"[INFO] Wrote sample list for {len(SAMPLES)} samples: {output[0]}\n")
 rule build_alignment_report:
     input:
-        summaries=expand(str(ALIGN_DIR / "{sample}" / "{sample}.align_summary.txt"), sample=SAMPLES)
+        summaries=expand(str(ALIGN_DIR / "{sample}" / "{sample}.align_summary.txt"), sample=SAMPLES),
+        script=str(SCRIPTS_DIR / "build_alignment_report.py")
     output:
         report=str(ALIGN_DIR / "alignment_report.csv")
     log:
         str(LOG_DIR / "build_alignment_report.log")
-    params:
-        script=str(SCRIPTS_DIR / "build_alignment_report.py")
     conda:
         "envs/rnaseq.yaml"
     shell:
         r"""
         set -euo pipefail
-        mkdir -p "$(dirname '{log}')"
-        exec > '{log}' 2>&1
-        python '{params.script}' \
-          --output '{output.report}' \
-          {input.summaries}
+        mkdir -p "$(dirname {log:q})"
+        exec > {log:q} 2>&1
+        python {input.script:q} \
+          --output {output.report:q} \
+          {input.summaries:q}
         """
 rule prepde_raw_counts:
     input:
         sample_lst=str(QUANT_DIR / "sample_lst.txt"),
-        gtf_files=expand(str(QUANT_DIR / "{sample}" / "{sample}.gtf"), sample=SAMPLES)
+        gtf_files=expand(str(QUANT_DIR / "{sample}" / "{sample}.gtf"), sample=SAMPLES),
+        lengths=READ_LENGTHS,
+        reference=NORMALIZED_GTF,
+        transcript_tables=expand(str(QUANT_DIR / "{sample}" / "t_data.ctab"), sample=SAMPLES) if USE_BALLGOWN else [],
+        script=str(PREPDE_SCRIPT)
     output:
         raw_count=str(QUANT_DIR / "gene_count_matrix.raw.csv"),
         transcript_count=str(QUANT_DIR / "transcript_count_matrix.csv")
     log:
         str(QUANT_LOG_DIR / "prepde_raw_counts.log")
     params:
-        prepde=str(PREPDE_SCRIPT),
+        ballgown="--ballgown" if USE_BALLGOWN else ""
     conda:
         "envs/rnaseq.yaml"
     shell:
         r"""
         set -euo pipefail
-        mkdir -p "$(dirname '{log}')"
-        exec > '{log}' 2>&1
-        if [ ! -f '{params.prepde}' ]; then
-          echo "[ERROR] prepDE.py not found at: {params.prepde}" >&2
-          echo "[ERROR] The pipeline expects workflow/scripts/prepDE.py to be bundled with the source code." >&2
-          exit 1
-        fi
-        python '{params.prepde}' \
-          -i '{input.sample_lst}' \
-          -g '{output.raw_count}' \
-          -t '{output.transcript_count}'
+        mkdir -p "$(dirname {log:q})"
+        exec > {log:q} 2>&1
+        python {input.script:q} \
+          -i {input.sample_lst:q} --read-lengths {input.lengths:q} --gene-id-only \
+          --reference {input.reference:q} {params.ballgown} \
+          -g {output.raw_count:q} -t {output.transcript_count:q}
         """
 rule finalize_expression_matrices:
     input:
         raw_count=str(QUANT_DIR / "gene_count_matrix.raw.csv"),
         abundance_tabs=expand(str(QUANT_DIR / "{sample}" / "{sample}_abundance.tab"), sample=SAMPLES),
-        annotation=ANNOTATION
+        annotation=NORMALIZED_GTF,
+        script=str(SCRIPTS_DIR / "build_expression_matrices.py"),
+        prepde=str(PREPDE_SCRIPT)
     output:
         count_matrix=str(QUANT_DIR / "gene_count_matrix.csv"),
         fpkm=str(QUANT_DIR / "gene_fpkm_matrix.csv"),
@@ -375,45 +622,63 @@ rule finalize_expression_matrices:
     log:
         str(QUANT_LOG_DIR / "finalize_expression_matrices.log")
     params:
-        script=str(SCRIPTS_DIR / "build_expression_matrices.py")
+        samples=SAMPLES
     conda:
         "envs/rnaseq.yaml"
     shell:
         r"""
         set -euo pipefail
-        mkdir -p "$(dirname '{log}')"
-        exec > '{log}' 2>&1
-        python '{params.script}' \
-          --annotation '{input.annotation}' \
-          --raw-count '{input.raw_count}' \
-          --out-count '{output.count_matrix}' \
-          --out-fpkm '{output.fpkm}' \
-          --out-tpm '{output.tpm}' \
-          {input.abundance_tabs}
+        mkdir -p "$(dirname {log:q})"
+        exec > {log:q} 2>&1
+        python {input.script:q} \
+          --annotation {input.annotation:q} \
+          --raw-count {input.raw_count:q} \
+          --out-count {output.count_matrix:q} \
+          --out-fpkm {output.fpkm:q} \
+          --out-tpm {output.tpm:q} \
+          --samples {params.samples:q} -- {input.abundance_tabs:q}
         """
 rule export_expression_xlsx:
     input:
         alignment_report=str(ALIGN_DIR / "alignment_report.csv"),
         count_matrix=str(QUANT_DIR / "gene_count_matrix.csv"),
         fpkm=str(QUANT_DIR / "gene_fpkm_matrix.csv"),
-        tpm=str(QUANT_DIR / "gene_tpm_matrix.csv")
+        tpm=str(QUANT_DIR / "gene_tpm_matrix.csv"),
+        script=str(SCRIPTS_DIR / "export_expression_xlsx.py"),
+        matrix_script=str(SCRIPTS_DIR / "build_expression_matrices.py"),
+        prepde=str(PREPDE_SCRIPT)
     output:
         xlsx=str(XLSX_OUT)
     log:
         str(QUANT_LOG_DIR / "export_expression_xlsx.log")
-    params:
-        script=str(SCRIPTS_DIR / "export_expression_xlsx.py")
     conda:
         "envs/rnaseq.yaml"
     shell:
         r"""
         set -euo pipefail
-        mkdir -p "$(dirname '{log}')"
-        exec > '{log}' 2>&1
-        python '{params.script}' \
-          --alignment-report '{input.alignment_report}' \
-          --count '{input.count_matrix}' \
-          --fpkm '{input.fpkm}' \
-          --tpm '{input.tpm}' \
-          --output '{output.xlsx}'
+        mkdir -p "$(dirname {log:q})"
+        exec > {log:q} 2>&1
+        python {input.script:q} \
+          --alignment-report {input.alignment_report:q} \
+          --count {input.count_matrix:q} \
+          --fpkm {input.fpkm:q} \
+          --tpm {input.tpm:q} \
+          --output {output.xlsx:q}
         """
+
+# Shell redirection opens logs before scripts can validate their own paths.
+# Protect every original input against every declared output/log, in both modes.
+protected_inputs = [ANNOTATION, *HISAT2_INDEX_FILES, *HISAT_EXTRA_INPUTS, *STRINGTIE_EXTRA_INPUTS]
+protected_inputs += [str(path) for path in SCRIPTS_DIR.glob("*.py")]
+protected_inputs += [str(path) for path in workflow.configfiles]
+if EXTERNAL_BED:
+    protected_inputs.append(EXTERNAL_BED)
+for sample in SAMPLES:
+    directory, suffixes = (RAW_DIR, (RAW_R1_SUFFIX, RAW_R2_SUFFIX)) if FASTP_ENABLED else (CLEAN_DIR, (R1_SUFFIX, R2_SUFFIX))
+    protected_inputs.extend(str(directory / sample / f"{sample}{suffix}") for suffix in suffixes)
+destinations = []
+for item in workflow.rules:
+    for kind, paths in (("output", item.output), ("log", item.log)):
+        for path in paths:
+            destinations.extend((f"{item.name} {kind}", concrete) for concrete in expand(str(path), sample=SAMPLES))
+protect_inputs(protected_inputs, destinations)

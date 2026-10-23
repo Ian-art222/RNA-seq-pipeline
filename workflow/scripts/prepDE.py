@@ -1,303 +1,333 @@
 #!/usr/bin/env python3
-import re, csv, sys, os, glob, warnings, itertools
-from math import ceil
-from optparse import OptionParser
-from operator import itemgetter
+"""StringTie coverage-derived read estimates, with explicit sample/read-length checks.
+
+Formula and legacy CLI are based on gpertea/stringtie prepDE.py3:
+https://github.com/gpertea/stringtie/blob/master/prepDE.py3
+Counts are ceil(transcript coverage * summed exon length / mean single-read length).
+They are estimates of reads, not directly counted paired-end fragments.
+"""
+import argparse
+import csv
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
 from collections import defaultdict
 
-parser=OptionParser(description='Generates two CSV files containing the count matrices for genes and transcripts, using the coverage values found in the output of `stringtie -e`')
-parser.add_option('-i', '--input', '--in', default='.', help="a folder containing all sample sub-directories, or a text file with sample ID and path to its GTF file on each line [default: %default/]")
-parser.add_option('-g', default='gene_count_matrix.csv', help="where to output the gene count matrix [default: %default")
-parser.add_option('-t', default='transcript_count_matrix.csv', help="where to output the transcript count matrix [default: %default]")
-parser.add_option('-l', '--length', default=75, type='int', help="the average read length [default: %default]")
-parser.add_option('-p', '--pattern', default=".", help="a regular expression that selects the sample subdirectories")
-parser.add_option('-c', '--cluster', action="store_true", help="whether to cluster genes that overlap with different gene IDs, ignoring ones with geneID pattern (see below)")
-parser.add_option('-s', '--string', default="MSTRG", help="if a different prefix is used for geneIDs assigned by StringTie [default: %default]")
-parser.add_option('-k', '--key', default="prepG", help="if clustering, what prefix to use for geneIDs assigned by this script [default: %default]")
-parser.add_option('-v', action="store_true", help="enable verbose processing")
+ATTR = re.compile(r'(?:^|;)\s*([^\s;]+)\s+"([^"]*)"\s*(?=;|$)')
 
-parser.add_option('--legend', default="legend.csv", help="if clustering, where to output the legend file mapping transcripts to assigned geneIDs [default: %default]")
-(opts, args)=parser.parse_args()
 
-samples = [] # List of tuples. If sample list, (first column, path). Else, (subdirectory name, path to gtf file in subdirectory)
-if (os.path.isfile(opts.input)):
-    # gtfList = True
-    try:
-        fin = open(opts.input, 'r')
-        for line in fin:
-            if line[0] != '#':
-                lineLst = tuple(line.strip().split(None,2))
-                if (len(lineLst) != 2):
-                    print("Error: line should have a sample ID and a file path:\n%s" % (line.strip()))
-                    exit(1)
-                if lineLst[0] in samples:
-                    print("Error: non-unique sample ID (%s)" % (lineLst[0]))
-                    exit(1)
-                if not os.path.isfile(lineLst[1]):
-                    print("Error: GTF file not found (%s)" % (lineLst[1]))
-                    exit(1)
-                samples.append(lineLst)
-    except IOError:
-        print("Error: List of .gtf files, %s, doesn't exist" % (opts.input))
-        exit(1)
-else:
-    # gtfList = False
-    ## Check that opts.input directory exists
-    if not os.path.isdir(opts.input):
-      parser.print_help()
-      print(" ")
-      print("Error: sub-directory '%s' not found!" % (opts.input))
-      sys.exit(1)
-    #####
-    ## Collect all samples file paths and if empty print help message and quit
-    #####
+def attributes(text):
+    result = {}
+    for key, value in ATTR.findall(text):
+        if key in result and key in {'gene_id', 'transcript_id', 'cov', 'gene_name', 'ref_gene_name', 'FPKM', 'TPM'}:
+            raise ValueError(f"Duplicate GTF attribute: {key}")
+        # Repeated descriptive metadata such as GENCODE tag is valid GTF.
+        result.setdefault(key, value)
+    return result
+
+
+def positive_length(value, label):
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a positive finite read length")
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f"{label} must be a positive finite read length")
+    return value
+
+
+def sample_list(path, pattern):
+    path = Path(path)
     samples = []
-    for i in next(os.walk(opts.input))[1]:
-        if re.search(opts.pattern,i):
-         for f in glob.iglob(os.path.join(opts.input,i,"*.gtf")):
-            samples.append((i,f)) 
-
-if len(samples) == 0:
-  parser.print_help()
-  print(" ")
-  print("Error: no GTF files found under base directory %s !" % (opts.input))
-  sys.exit(1)
-
-RE_GENE_ID=re.compile('gene_id "([^"]+)"')
-RE_GENE_NAME=re.compile('gene_name "([^"]+)"')
-RE_TRANSCRIPT_ID=re.compile('transcript_id "([^"]+)"')
-RE_COVERAGE=re.compile(r'cov "([\-+\d\.]+)"')
-RE_STRING=re.compile(re.escape(opts.string))
-
-RE_GFILE=re.compile(r'\-G\s*(\S+)') #assume filepath without spaces..
-
-
-#####
-## Sort the sample names by the sample ID
-#####
-
-samples.sort()
-
-#if opts.v:
-#  print "Sample GTFs found:"
-#  for s in samples:
-#     print s[1]
-
-#####
-## Checks whether a given row is a transcript 
-## other options: ex. exon, transcript, mRNA, 5'UTR
-#####
-def is_transcript(x):
-  return len(x)>2 and x[2]=="transcript"
-
-def getGeneID(s, ctg, tid):
-  r=RE_GENE_ID.search(s)
-  #if r: return r.group(1)
-  rn=RE_GENE_NAME.search(s)
-  #if rn: return ctg+'|'+rn.group(1)
-  if r:
-    if rn: 
-      return r.group(1)+'|'+rn.group(1)
+    if path.is_file():
+        with path.open(encoding="utf-8") as handle:
+            for number, line in enumerate(handle, 1):
+                if not line.strip() or line.lstrip().startswith('#'):
+                    continue
+                fields = line.strip().split(None, 1)
+                if len(fields) != 2:
+                    raise ValueError(f"{path}:{number}: expected sample ID and GTF path")
+                samples.append((fields[0], Path(fields[1])))
+    elif path.is_dir():
+        for directory in sorted(path.iterdir()):
+            if directory.is_dir() and re.search(pattern, directory.name):
+                samples.extend((directory.name, p) for p in sorted(directory.glob('*.gtf')))
     else:
-      return r.group(1)
-  return tid
-
-def getCov(s):
-  r=RE_COVERAGE.search(s)
-  if r:
-    v=float(r.group(1))
-    if v<0.0: v=0.0
-    return v
-  return 0.0
-
-def is_overlap(x,y): #NEEDS TO BE INTS!
-  return x[0]<=y[1] and y[0]<=x[1]
-
-
-def t_overlap(t1, t2): #from badGenes: chromosome, strand, cluster, start, end, (e1start, e1end)...
-    if t1[0] != t2[0] or t1[1] != t2[1] or t1[5]<t2[4]: return False
-    for i in range(6, len(t1)):
-        for j in range(6, len(t2)):
-            if is_overlap(t1[i], t2[j]): return True
-    return False
-
-## Average Readlength
-read_len=opts.length
-
-## Variables/Matrices to store t/g_counts
-t_count_matrix, g_count_matrix=[],[]
-
-##Get ready for clustering, stuff is once for all samples##
-geneIDs=defaultdict(lambda: str) #key=transcript, value=cluster/gene_id
+        raise ValueError(f"Input does not exist: {path}")
+    if not samples:
+        raise ValueError(f"No sample GTF files found: {path}")
+    seen = set()
+    for sample, gtf in samples:
+        if sample in seen:
+            raise ValueError(f"Duplicate sample ID: {sample}")
+        if not sample or any(char.isspace() for char in sample):
+            raise ValueError(f"Invalid sample ID: {sample!r}")
+        seen.add(sample)
+        if not gtf.is_file():
+            raise ValueError(f"GTF file not found: {gtf}")
+    return sorted(samples)
 
 
-## For each of the sorted sample paths
-for s in samples:
-    badGenes=[] #list of bad genes (just ones that aren't MSTRG)
-    try:
-        ## opts.input = parent directory of sample subdirectories
-        ## s = sample currently iterating through
-        ## os.path.join(opts.input,s,"*.gtf") path to current sample's GTF
-        ## split = list of lists: [[chromosome, ...],...]
+def unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"Duplicate read-length sample: {key}")
+        result[key] = value
+    return result
 
-        #with open(glob.iglob(os.path.join(opts.input,s,"*.gtf")).next()) as f:
-        #    split=[l.split('\t') for l in f.readlines()]
-#        if not gtfList:
-#            f = open(glob.iglob(os.path.join(opts.input,s[1],"*.gtf")).next())
-#        else:
-#            f = open(s[1])
-        with open(s[1]) as f:
-            split=[l.split('\t') for l in f.readlines()]
 
-        ## i = numLine; v = corresponding i-th GTF row
-        for i,v in enumerate(split):
-            if is_transcript(v):
-                try:
-                  t_id=RE_TRANSCRIPT_ID.search(v[8]).group(1)
-                  g_id=getGeneID(v[8], v[0], t_id)
-                except:
-                  print("Problem parsing file %s at line:\n:%s\n" % (s[1], v))
-                  sys.exit(1)
-                geneIDs[t_id]=g_id
-                if not RE_STRING.match(g_id):
-                    badGenes.append([v[0],v[6], t_id, g_id, min(int(v[3]),int(v[4])), max(int(v[3]),int(v[4]))]) #chromosome, strand, cluster/transcript id, start, end
-                    j=i+1
-                    while j<len(split) and split[j][2]=="exon":
-                        badGenes[len(badGenes)-1].append((min(int(split[j][3]), int(split[j][4])), max(int(split[j][3]), int(split[j][4]))))
-                        j+=1
+def read_lengths(args, samples):
+    default = positive_length(args.length, '-l/--length')
+    if not args.read_lengths:
+        return {sample: default for sample, _ in samples}
+    with open(args.read_lengths, encoding='utf-8') as handle:
+        values = json.load(handle, object_pairs_hook=unique_json_object)
+    expected = {sample for sample, _ in samples}
+    if not isinstance(values, dict) or set(values) != expected:
+        raise ValueError('Read-length JSON sample IDs must exactly match the sample list')
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values.values()):
+        raise ValueError('Read-length JSON values must be numbers, not strings or booleans')
+    return {sample: positive_length(value, f'read length for {sample}') for sample, value in values.items()}
 
-    except StopIteration:
-        warnings.warn("Didn't get a GTF in that directory. Looking in another...")
 
-    else: #we found the "bad" genes!
-        break
-
-##THE CLUSTERING BEGINS!##
-if opts.cluster and len(badGenes)>0:
-    clusters=[] #lists of lists (could be sets) or something of transcripts
-    badGenes.sort(key=itemgetter(3)) #sort by start coord...?
-    i=0
-    while i<len(badGenes): #rather un-pythonic
-        temp_cluster=[badGenes[i]]
-
-        k=0
-        while k<len(temp_cluster):
-            j=i+1
-            while j<len(badGenes):
-                if t_overlap(temp_cluster[k], badGenes[j]):
-                    temp_cluster.append(badGenes[j])
-                    del badGenes[j]
-                else:
-                    j+=1
-            k+=1
-        if len(temp_cluster)>1:
-            clusters.append([t[2] for t in temp_cluster])
-        i+=1
-
-    print(len(clusters))
-
-    for c in clusters:
-        c.sort()
-
-    clusters.sort(key=itemgetter(0))
-    legend=[]
-    for u,c in enumerate(clusters):
-        my_ID=opts.key+str((u+1))
-        legend.append(list(itertools.chain.from_iterable([[my_ID],c]))) #my_ID, clustered transcript IDs
-        for t in c:
-            geneIDs[t]=my_ID
-##            geneIDs[t]="|".join(c) #duct-tape transcript IDs together, disregarding ref_gene_names and things like that
-
-    with open(opts.legend, 'w') as l_file:
-        my_writer=csv.writer(l_file)
-        my_writer.writerows(legend)
-
-geneDict=defaultdict(lambda: defaultdict(lambda: 0)) #key=gene/cluster, value=dictionary with key=sample, value=summed counts
-t_dict=defaultdict(lambda: defaultdict(lambda: 0))
-guidesFile='' # file given with -G for the 1st sample
-for q, s in enumerate(samples):
-    if opts.v:
-       print(">processing sample %s from file %s" % s)
-    lno=0
-    try:
-        #with open(glob.iglob(os.path.join(opts.input,s,"*.gtf")).next()) as f: #grabs first .gtf file it finds inside the sample subdirectory
-#        if not gtfList:
-#            f = open(glob.iglob(os.path.join(opts.input,s[1],"*.gtf")).next())
-#        else:
-        f = open(s[1])
-        transcript_len=0
-        
-        for l in f:
-            lno+=1
-            if l.startswith('#'):
-                if lno==1:
-                    ei=l.find('-e')
-                    if ei<0:
-                       print("Error: sample file %s was not generated with -e option!" % ( s[1] ))
-                       sys.exit(1)
-                    gf=RE_GFILE.search(l)
-                    if gf:
-                       gfile=gf.group(1)
-                       if guidesFile:
-                          if gfile != guidesFile:
-                             print("Warning: sample file %s generated with a different -G file (%s) than the first sample (%s)" % ( s[1], gfile, guidesFile ))
-                       else:
-                          guidesFile=gfile
-                    else:
-                       print("Error: sample %s was not processed with -G option!" % ( s[1] ))
-                       sys.exit(1)
+def parse_gtf(path, gene_id_only=False, reference=False):
+    transcripts, exons = {}, defaultdict(list)
+    command_seen = False
+    with path.open(encoding='utf-8') as handle:
+        for number, line in enumerate(handle, 1):
+            if not line.strip():
                 continue
-            v=l.split('\t')
-            if v[2]=="transcript":
-                if transcript_len>0:
-##                        transcriptList.append((g_id, t_id, int(ceil(coverage*transcript_len/read_len))))
-                    t_dict[t_id][s[0]] = int(ceil(coverage*transcript_len/read_len))
-                t_id=RE_TRANSCRIPT_ID.search(v[len(v)-1]).group(1)
-                #g_id=RE_GENE_ID.search(v[len(v)-1]).group(1)
-                g_id=getGeneID(v[8], v[0], t_id)
-                #coverage=float(RE_COVERAGE.search(v[len(v)-1]).group(1))
-                coverage=getCov(v[8])
-                transcript_len=0
-            if v[2]=="exon":
-                transcript_len+=int(v[4])-int(v[3])+1 #because end coordinates are inclusive in GTF
+            if line.startswith('#'):
+                if re.search(r'(?:^|\s)-e(?:\s|$)', line) and re.search(r'(?:^|\s)-G\S*(?:\s|$)', line):
+                    command_seen = True
+                continue
+            fields = line.rstrip('\n').split('\t')
+            if len(fields) != 9:
+                raise ValueError(f'{path}:{number}: expected nine GTF fields')
+            if reference and fields[2] == 'gene':
+                continue
+            if fields[2] not in ('transcript', 'exon'):
+                raise ValueError(f'{path}:{number}: unexpected StringTie feature {fields[2]!r}')
+            start, end = int(fields[3]), int(fields[4])
+            if start < 1 or end < start or fields[6] not in ('+', '-'):
+                raise ValueError(f'{path}:{number}: invalid coordinates or strand')
+            attrs = attributes(fields[8])
+            tid, gid = attrs.get('transcript_id'), attrs.get('gene_id')
+            if not tid or not gid:
+                raise ValueError(f'{path}:{number}: transcript_id and gene_id are required')
+            if fields[2] == 'transcript':
+                if tid in transcripts:
+                    raise ValueError(f'{path}:{number}: duplicate transcript {tid}')
+                if not reference and 'cov' not in attrs:
+                    raise ValueError(f'{path}:{number}: missing transcript coverage')
+                coverage = 0.0 if reference else float(attrs['cov'])
+                if not math.isfinite(coverage) or coverage < 0:
+                    raise ValueError(f'{path}:{number}: coverage must be finite and nonnegative')
+                symbol = attrs.get('gene_name') or attrs.get('ref_gene_name')
+                output_gene = gid if gene_id_only or not symbol else gid + '|' + symbol
+                transcripts[tid] = dict(gene=output_gene, canonical_gene=gid, chrom=fields[0], strand=fields[6],
+                                        start=start, end=end, coverage=coverage)
+            else:
+                exons[tid].append((fields[0], fields[6], start, end, gid))
+    if not reference and not command_seen:
+        raise ValueError(f'{path}: missing StringTie -e -G command provenance')
+    if not transcripts:
+        raise ValueError(f'{path}: no quantified transcript models')
+    if set(exons) != set(transcripts):
+        raise ValueError(f'{path}: transcript/exon IDs differ; every transcript requires exons')
+    for tid, transcript in transcripts.items():
+        ordered = sorted(exons[tid], key=lambda exon: exon[2])
+        previous_end = 0
+        for chrom, strand, start, end, gid in ordered:
+            if (chrom, strand, gid) != (transcript['chrom'], transcript['strand'], transcript['canonical_gene']):
+                raise ValueError(f'{path}: inconsistent exon metadata for {tid}')
+            if start < transcript['start'] or end > transcript['end'] or start <= previous_end:
+                raise ValueError(f'{path}: overlapping or out-of-bounds exons for {tid}')
+            previous_end = end
+        transcript['exons'] = tuple((x[2], x[3]) for x in ordered)
+        transcript['length'] = sum(end - start + 1 for start, end in transcript['exons'])
+    return transcripts
 
-##            transcriptList.append((g_id, t_id, int(ceil(coverage*transcript_len/read_len))))
-        t_dict[t_id][s[0]]=int(ceil(coverage*transcript_len/read_len))
 
-    except StopIteration:
-#        if not gtfList:
-#            warnings.warn("No GTF file found in " + os.path.join(opts.input,s[1]))
-#        else:
-        warnings.warn("No GTF file found in " + s[1])
+def match_reference(models, reference, label):
+    extra = set(models) - set(reference)
+    if extra:
+        raise ValueError(f'{label}: unexpected reference transcript IDs {sorted(extra)[:10]}')
+    fields = ('gene', 'canonical_gene', 'chrom', 'strand', 'start', 'end', 'exons')
+    for tid, model in models.items():
+        if any(model[field] != reference[tid][field] for field in fields):
+            raise ValueError(f'{label}: inconsistent reference model for transcript {tid}')
 
 
-##        transcriptList.sort(key=lambda bla: bla[1]) #gene_id
-    
-    for i,v in t_dict.items():
-##        print i,v
-       try:
-          geneDict[geneIDs[i]][s[0]]+=v[s[0]]
-       except KeyError:
-          print("Error: could not locate transcript %s entry for sample %s" % ( i, s[0] ))
-          raise
+def complete_from_ballgown(models, reference, path, sample):
+    """Recover GTF omissions only from explicit zero estimates in StringTie -B.
 
-if opts.v:
-   print("..writing %s " % ( opts.t ))
-with open(opts.t, 'w') as csvfile:
-   my_writer = csv.DictWriter(csvfile, fieldnames = ["transcript_id"] + [x for x,y in samples])
-   my_writer.writerow(dict((fn,fn) for fn in my_writer.fieldnames))
-   for i in t_dict:
-        t_dict[i]["transcript_id"] = i
-        my_writer.writerow(t_dict[i])
-if opts.v:
-   print("..writing %s " % ( opts.g ))
-with open(opts.g, 'w') as csvfile:
-   my_writer = csv.DictWriter(csvfile, fieldnames = ["gene_id"] + [x for x,y in samples])
-##    my_writer.writerow([""]+samples)
-##    my_writer.writerows(geneDict)
-   my_writer.writerow(dict((fn,fn) for fn in my_writer.fieldnames))
-   for i in geneDict:
-        geneDict[i]["gene_id"] = i #add gene_id to row
-        my_writer.writerow(geneDict[i])
-if opts.v:
-   print("All done.")
+    StringTie 2.2.3 can omit a redundant, zero-estimated isoform from its GTF
+    inside an expressed bundle, while retaining its zero in t_data.ctab.
+    This is an estimator-assigned zero, not evidence of biological absence.
+    """
+    expected_header = ['t_id', 'chr', 'strand', 'start', 'end', 't_name',
+                       'num_exons', 'length', 'gene_id', 'gene_name', 'cov', 'FPKM']
+    records, row_ids = {}, set()
+    with path.open(encoding='utf-8', newline='') as handle:
+        reader = csv.reader(handle, delimiter='\t')
+        if next(reader, None) != expected_header:
+            raise ValueError(f'{path}: invalid Ballgown transcript header')
+        for number, row in enumerate(reader, 2):
+            if len(row) != len(expected_header):
+                raise ValueError(f'{path}:{number}: invalid Ballgown transcript row width')
+            rid, tid = int(row[0]), row[5]
+            if rid < 1 or rid in row_ids or not tid or tid in records or tid not in reference:
+                raise ValueError(f'{path}:{number}: missing, duplicate or unexpected transcript ID')
+            row_ids.add(rid)
+            model = reference[tid]
+            observed = (row[8], row[1], row[2], int(row[3]), int(row[4]), int(row[6]), int(row[7]))
+            expected = (model['canonical_gene'], model['chrom'], model['strand'], model['start'],
+                        model['end'], len(model['exons']), model['length'])
+            if observed != expected:
+                raise ValueError(f'{path}:{number}: Ballgown/reference model mismatch for {tid}')
+            coverage, fpkm = float(row[10]), float(row[11])
+            if any(not math.isfinite(value) or value < 0 for value in (coverage, fpkm)):
+                raise ValueError(f'{path}:{number}: non-finite or negative Ballgown estimate')
+            if tid in models and coverage != models[tid]['coverage']:
+                raise ValueError(f'{path}:{number}: Ballgown/GTF coverage mismatch for {tid}')
+            records[tid] = (coverage, fpkm)
+    if set(records) != set(reference):
+        raise ValueError(f'{path}: Ballgown transcript IDs do not exactly match the reference')
+    missing = sorted(set(reference) - set(models))
+    for tid in missing:
+        if records[tid] != (0.0, 0.0):
+            raise ValueError(f'{sample}: GTF omitted nonzero Ballgown transcript {tid}; cannot restore zero')
+        models[tid] = dict(reference[tid], coverage=0.0)
+    if missing:
+        print(f'[INFO] {sample}: restored {len(missing)} reference transcript(s) omitted from GTF '
+              f'using explicit zero cov/FPKM in {path}: {", ".join(missing)}', file=sys.stderr)
+    return models
+
+
+def atomic_csv(path, header, rows):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.writer(handle)
+            if header is not None:
+                writer.writerow(header)
+            writer.writerows(rows)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def clustered_genes(models, prefix, key):
+    """Keep legacy -c: connected same-strand exon overlaps form clusters."""
+    mapping = {tid: model['gene'] for tid, model in models.items()}
+    parent = {tid: tid for tid in models if not models[tid]['gene'].startswith(prefix)}
+    def find(tid):
+        while parent[tid] != tid:
+            parent[tid] = parent[parent[tid]]
+            tid = parent[tid]
+        return tid
+    loci = defaultdict(list)
+    for tid in parent:
+        model = models[tid]
+        loci[(model['chrom'], model['strand'])].append(tid)
+    for tids in loci.values():
+        tids.sort(key=lambda tid: models[tid]['start'])
+        for index, first in enumerate(tids):
+            for second in tids[index + 1:]:
+                if models[second]['start'] > models[first]['end']:
+                    break
+                if any(a <= d and c <= b for a, b in models[first]['exons'] for c, d in models[second]['exons']):
+                    parent[find(second)] = find(first)
+    groups = defaultdict(list)
+    for tid in parent:
+        groups[find(tid)].append(tid)
+    clusters = sorted(sorted(group) for group in groups.values() if len(group) > 1)
+    legend = []
+    for index, group in enumerate(clusters, 1):
+        gid = key + str(index)
+        legend.append([gid] + group)
+        for tid in group:
+            mapping[tid] = gid
+    return mapping, legend
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('-i', '--input', '--in', default='.')
+    parser.add_argument('-g', default='gene_count_matrix.csv')
+    parser.add_argument('-t', default='transcript_count_matrix.csv')
+    parser.add_argument('-l', '--length', type=float, default=75.0, help='Mean single-read length (default: 75)')
+    parser.add_argument('--read-lengths', help='JSON mapping every sample ID to its positive finite mean read length')
+    parser.add_argument('--reference', type=Path, help='Normalized reference GTF; require all its transcript models')
+    parser.add_argument('--ballgown', action='store_true', help='Validate each GTF against adjacent t_data.ctab; restore only explicitly zero reference models (requires --reference)')
+    parser.add_argument('--gene-id-only', action='store_true', help='Use exact annotation gene_id; never append or split gene symbols')
+    parser.add_argument('-p', '--pattern', default='.')
+    parser.add_argument('-c', '--cluster', action='store_true')
+    parser.add_argument('-s', '--string', default='MSTRG')
+    parser.add_argument('-k', '--key', default='prepG')
+    parser.add_argument('--legend', default='legend.csv')
+    parser.add_argument('-v', action='store_true')
+    args = parser.parse_args()
+    if args.ballgown and not args.reference:
+        parser.error('--ballgown requires --reference')
+    samples = sample_list(args.input, args.pattern)
+    lengths = read_lengths(args, samples)
+    reference = parse_gtf(args.reference, args.gene_id_only, reference=True) if args.reference else None
+
+    def load_models(sample, path):
+        models = parse_gtf(path, args.gene_id_only)
+        if reference is not None:
+            match_reference(models, reference, sample)
+            if args.ballgown:
+                models = complete_from_ballgown(models, reference, path.with_name('t_data.ctab'), sample)
+            missing = set(reference) - set(models)
+            if missing:
+                raise ValueError(f'{sample}: GTF is missing reference transcripts {sorted(missing)[:10]}; '
+                                 'enable StringTie Ballgown output and --ballgown for explicit zero verification, '
+                                 'or inspect the annotation and StringTie output')
+            models = {tid: models[tid] for tid in reference}
+        return models
+
+    first = load_models(*samples[0])
+    gene_ids = {tid: model['gene'] for tid, model in first.items()}
+    if args.cluster:
+        gene_ids, legend = clustered_genes(first, args.string, args.key)
+        atomic_csv(args.legend, None, legend)
+    # Retain one reference model set and the numeric matrices, not a complete
+    # copy of every sample's exon/attribute objects in memory.
+    names = [sample for sample, _ in samples]
+    transcript_counts = {tid: [] for tid in first}
+    gene_counts = {gid: [0] * len(samples) for gid in dict.fromkeys(gene_ids.values())}
+    for sample_index, (sample, path) in enumerate(samples):
+        sample_models = first if sample_index == 0 else load_models(sample, path)
+        if set(sample_models) != set(first):
+            raise ValueError(f'{sample}: transcript IDs do not match other samples')
+        for tid, model in sample_models.items():
+            fields = ('gene', 'canonical_gene', 'chrom', 'strand', 'exons')
+            if any(model[field] != first[tid][field] for field in fields):
+                raise ValueError(f'{sample}: inconsistent reference model for transcript {tid}')
+            estimate = model['coverage'] * model['length'] / lengths[sample]
+            if not math.isfinite(estimate):
+                raise ValueError(f'{sample}/{tid}: non-finite count estimate')
+            value = math.ceil(estimate)
+            transcript_counts[tid].append(value)
+            gene_counts[gene_ids[tid]][sample_index] += value
+    atomic_csv(args.t, ['transcript_id'] + names, ([tid] + values for tid, values in transcript_counts.items()))
+    atomic_csv(args.g, ['gene_id'] + names, ([gid] + values for gid, values in gene_counts.items()))
+    if args.v:
+        print(f'Wrote {len(gene_counts)} genes and {len(transcript_counts)} transcripts for {len(samples)} samples')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OSError) as error:
+        raise SystemExit(f'[ERROR] {error}')

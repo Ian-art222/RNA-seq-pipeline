@@ -3,15 +3,49 @@
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import unquote
 
 
 GTF_ATTRIBUTE = re.compile(r'\s*([^\s;]+)\s+(?:"([^"\\]*(?:\\.[^"\\]*)*)"|([^;\s]+))\s*(?:;|$)')
 MODEL_FEATURES = {"exon", "cds", "utr", "five_prime_utr", "three_prime_utr", "transcript", "mrna"}
+
+
+def protect_paths(inputs, outputs):
+    """Reject input/output aliases, including symlinks and hard links, before writing."""
+    inputs, outputs = [Path(path) for path in inputs], [Path(path) for path in outputs]
+
+    def same_path(first, second):
+        return first.resolve() == second.resolve() or (
+            first.exists() and second.exists() and first.samefile(second)
+        )
+
+    for index, output in enumerate(outputs):
+        for source in inputs:
+            if same_path(output, source):
+                raise ValueError(f"Output {output} aliases protected input {source}")
+        for previous in outputs[:index]:
+            if same_path(output, previous):
+                raise ValueError(f"Outputs {output} and {previous} alias each other")
+
+
+def write_json(path, report):
+    """Atomically replace a report without following an existing output hard link."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(report, handle, ensure_ascii=False, indent=2, allow_nan=False)
+            handle.write("\n")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def annotation_rows(path):
@@ -57,25 +91,29 @@ def parse_gtf_attributes(text, location):
 
 def read_gtf_models(path):
     """Read exon models; never infer missing exons from CDS or transcript spans."""
-    models = {}
+    models, declared_genes = {}, {}
     input_exons = 0
     for number, fields, start, end in annotation_rows(path):
         feature = fields[2].lower()
         location = f"{path}:{number}"
         attributes = parse_gtf_attributes(fields[8], location)
+        gene = attributes.get("gene_id")
+        if feature in {"gene", "pseudogene"} or feature.endswith("_gene"):
+            if not gene:
+                raise ValueError(f"{location}: gene requires a nonempty gene_id")
+            declared_genes.setdefault(gene, []).append((fields[0], fields[6], start, end))
         tid = attributes.get("transcript_id")
         if not tid:
             if feature in MODEL_FEATURES or feature.endswith("_utr"):
                 raise ValueError(f"{location}: {fields[2]} requires transcript_id and gene_id")
             continue
-        gene = attributes.get("gene_id")
         if not gene or any(char.isspace() for char in tid) or not tid:
             raise ValueError(f"{location}: transcript requires a nonempty gene_id and a whitespace-free transcript_id")
         if fields[6] not in {"+", "-"}:
             raise ValueError(f"{location}: transcript {tid!r} must have strand '+' or '-'")
         identity = (fields[0], fields[6], gene)
         if tid not in models:
-            models[tid] = {"identity": identity, "exons": [], "spans": []}
+            models[tid] = {"identity": identity, "exons": [], "spans": [], "subfeatures": []}
         model = models[tid]
         if model["identity"] != identity:
             raise ValueError(f"{location}: transcript_id {tid!r} has inconsistent chromosome, strand, or gene_id")
@@ -84,12 +122,18 @@ def read_gtf_models(path):
             input_exons += 1
         elif feature in {"transcript", "mrna"}:
             model["spans"].append((start, end))
+        elif feature in {"cds", "utr"} or feature.endswith("_utr"):
+            model["subfeatures"].append((number, fields[2], start, end))
     if not models:
         raise ValueError(f"{path}: no transcript exon models found; provide a GTF with exon records")
     missing = sorted(tid for tid, model in models.items() if not model["exons"])
     if missing:
         examples = ", ".join(missing[:5])
         raise ValueError(f"{path}: {len(missing)} transcript(s) lack exon records ({examples}); supply explicit exon models")
+    missing_genes = set(declared_genes) - {model["identity"][2] for model in models.values()}
+    if missing_genes:
+        raise ValueError(f"{path}: {len(missing_genes)} gene(s) lack transcript/exon models "
+                         f"({', '.join(sorted(missing_genes)[:5])}); provide complete exon annotation")
     records = []
     for tid, model in models.items():
         blocks = []
@@ -99,9 +143,17 @@ def read_gtf_models(path):
             else:
                 blocks.append((start, end))
         start, end = blocks[0][0], blocks[-1][1]
+        chrom, strand, gene = model["identity"]
+        for gene_chrom, gene_strand, left, right in declared_genes.get(gene, []):
+            if chrom != gene_chrom or (gene_strand in {"+", "-"} and strand != gene_strand):
+                raise ValueError(f"{path}: transcript {tid!r} chromosome/strand disagrees with declared gene {gene!r}")
+            if start < left or end > right or any(a < left or b > right for a, b in model["spans"]):
+                raise ValueError(f"{path}: transcript {tid!r} extends outside declared gene {gene!r}")
         if any(start < left or end > right for left, right in model["spans"]):
             raise ValueError(f"{path}: exon blocks extend outside declared transcript {tid!r}")
-        chrom, strand, _ = model["identity"]
+        for number, feature, left, right in model["subfeatures"]:
+            if not any(exon_start <= left and right <= exon_end for exon_start, exon_end in blocks):
+                raise ValueError(f"{path}:{number}: {feature} interval is not contained in exon blocks of transcript {tid!r}")
         records.append({"chrom": chrom, "start": start, "end": end, "name": tid, "strand": strand, "blocks": blocks})
     records.sort(key=lambda row: (row["chrom"], row["start"], row["end"], row["name"]))
     return records, {"input_exon_records": input_exons,
@@ -194,7 +246,7 @@ def gff3_transcripts(path, report):
     """Audit source model support before gffread can synthesize or omit records."""
     features, gene_ids, expected = [], set(), set()
     exon_models, cds_utr_models, identities = set(), set(), {}
-    declared_transcripts, child_records = {}, []
+    declared_transcripts, declared_genes, child_records, exon_intervals = {}, {}, [], {}
     for number, fields, start, end in annotation_rows(path):
         attributes = {}
         for item in fields[8].split(";"):
@@ -207,8 +259,10 @@ def gff3_transcripts(path, report):
                 raise ValueError(f"{path}:{number}: repeated GFF3 {key}")
             attributes[key] = value
         feature = fields[2].lower()
-        tid = unquote(attributes.get("ID", ""))
-        parents = {unquote(value) for value in attributes.get("Parent", "").split(",") if value}
+        # gffread preserves percent escapes in identifiers. Keep the same spelling
+        # throughout validation, normalized GTF, BED12 and downstream matrices.
+        tid = attributes.get("ID", "")
+        parents = {value for value in attributes.get("Parent", "").split(",") if value}
         is_gene = feature in {"gene", "pseudogene"} or feature.endswith("_gene")
         is_transcript = feature in {"transcript", "mrna"} or feature.endswith("rna") or feature.endswith("_transcript")
         is_exon_feature = feature in {"exon", "cds", "utr"} or feature.endswith("_utr")
@@ -223,7 +277,13 @@ def gff3_transcripts(path, report):
             raise ValueError(f"{path}:{number}: transcript/exon models require strand '+' or '-'")
         if is_gene:
             gene_ids.add(tid)
+            declared_genes.setdefault(tid, []).append((fields[0], fields[6], start, end))
         if is_transcript:
+            # GTF/StringTie assigns each transcript to one gene. gffread 0.12.9
+            # silently keeps only the first gene when Parent has multiple IDs.
+            if len(parents) > 1:
+                raise ValueError(f"{path}:{number}: transcript {tid!r} has multiple Parent IDs; "
+                                 "GTF quantification requires one gene per transcript")
             expected.add(tid)
             declared_transcripts.setdefault(tid, []).append((fields[0], fields[6], start, end))
         if is_exon_feature:
@@ -233,21 +293,35 @@ def gff3_transcripts(path, report):
             child_records.append((number, fields[2], fields[0], fields[6], start, end, parents))
             if feature == "exon":
                 exon_models.update(parents)
+                for parent in parents:
+                    exon_intervals.setdefault((parent, fields[0], fields[6]), []).append((start, end))
             else:
                 cds_utr_models.update(parents)
         features.append((tid, parents))
-    expected.update(tid for tid, parents in features if tid and parents & gene_ids)
+    # A gene may also parent regulatory features (e.g. TF_binding_site). Only
+    # declared transcripts and parents of exon/CDS/UTR records are model IDs.
     genes_with_models = gene_ids & expected
     for tid, parents in features:
         if tid in expected:
             genes_with_models.update(parents & gene_ids)
+            # Check declared genes before gffread discards their feature rows.
+            for parent in parents & gene_ids:
+                for chrom, strand, start, end in declared_transcripts.get(tid, []):
+                    for gene_chrom, gene_strand, left, right in declared_genes[parent]:
+                        if chrom != gene_chrom or (gene_strand in {"+", "-"} and strand != gene_strand):
+                            raise ValueError(f"{path}: transcript {tid!r} chromosome/strand disagrees with declared gene {parent!r}")
+                        if start < left or end > right:
+                            raise ValueError(f"{path}: transcript {tid!r} extends outside declared gene {parent!r}")
     missing_genes = gene_ids - genes_with_models
     unsupported = expected - exon_models - cds_utr_models
     report.update(source_gene_count=len(gene_ids), source_transcript_model_count=len(expected),
                   source_models_with_explicit_exons=len(exon_models),
-                  source_models_without_explicit_exons=len(expected - exon_models))
+                  source_models_without_explicit_exons=len(expected - exon_models),
+                  source_models_without_explicit_exon_ids=sorted(expected - exon_models))
     # Validate source coordinates before normalization can repair a malformed
     # transcript span. GFF3 permits child records before their parent record.
+    for intervals in exon_intervals.values():
+        intervals.sort()
     for number, feature, chrom, strand, start, end, parents in child_records:
         for parent in parents:
             for declared_chrom, declared_strand, left, right in declared_transcripts.get(parent, []):
@@ -255,6 +329,17 @@ def gff3_transcripts(path, report):
                     raise ValueError(f"{path}:{number}: {feature} chromosome/strand disagrees with declared transcript {parent!r}")
                 if start < left or end > right:
                     raise ValueError(f"{path}:{number}: {feature} interval extends outside declared transcript {parent!r}")
+            if feature.lower() != "exon" and parent in exon_models:
+                exons = exon_intervals.get((parent, chrom, strand), [])
+                covered = start
+                for left, right in exons:
+                    if left > covered:
+                        break
+                    covered = max(covered, right)
+                    if covered >= end:
+                        break
+                if covered < end:
+                    raise ValueError(f"{path}:{number}: {feature} interval is not contained in exon blocks of transcript {parent!r}")
     if missing_genes:
         raise ValueError(f"{path}: {len(missing_genes)} gene(s) lack transcript/exon/CDS/UTR models "
                          f"({', '.join(sorted(missing_genes)[:5])}); provide complete exon annotation")
@@ -264,14 +349,14 @@ def gff3_transcripts(path, report):
     return expected
 
 
-def prepare_annotation(annotation, output, report, external_bed=None):
+def prepare_annotation(annotation, output, report, external_bed=None, normalized_gtf=None):
     source = Path(annotation)
     report["annotation_format"] = annotation_format(source)
     normalized = source
     expected_ids = None
     if report["annotation_format"] == "gff3":
         expected_ids = gff3_transcripts(source, report)
-        normalized = Path(str(output) + ".normalized.gtf")
+        normalized = Path(normalized_gtf) if normalized_gtf else Path(str(output) + ".normalized.gtf")
         conversion_log = Path(str(output) + ".gffread.log")
         normalized.parent.mkdir(parents=True, exist_ok=True)
         command = ["gffread", str(source), "-T", "-o", str(normalized)]
@@ -306,6 +391,19 @@ def prepare_annotation(annotation, output, report, external_bed=None):
         if missing or extra or changed:
             raise ValueError(f"external BED12 does not match annotation: {len(missing)} missing, {len(extra)} extra, {len(changed)} inconsistent transcript model(s)")
         report["external_bed12_validation"] = "exact transcript ID, chromosome, strand, interval, and exon-block match"
+    if normalized_gtf and report["annotation_format"] == "gtf":
+        destination = Path(normalized_gtf)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=destination.name + ".", delete=False) as handle:
+                temporary = Path(handle.name)
+            shutil.copyfile(source, temporary)
+            temporary.replace(destination)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        report["normalized_annotation"] = str(destination)
     write_bed12(records, output)
     report.update(status="passed", transcript_count=len(records), reference_sequence_count=len({row["chrom"] for row in records}))
 
@@ -316,24 +414,32 @@ def main(argv=None):
     parser.add_argument("--output", required=True, help="Validated BED12 output")
     parser.add_argument("--report", required=True, help="JSON validation report, including failures")
     parser.add_argument("--bed12", help="Optional external BED12; must exactly match annotation models")
+    parser.add_argument("--normalized-gtf", help="Validated GTF for StringTie and matrices; GTF inputs are copied without changing IDs")
     args = parser.parse_args(argv)
     # Never overwrite source annotations, or confuse report and result paths.
-    sources = {Path(args.annotation).resolve()}
+    sources = [args.annotation]
     if args.bed12:
-        sources.add(Path(args.bed12).resolve())
-    outputs = [Path(path).resolve() for path in (args.output, args.report, args.output + ".normalized.gtf", args.output + ".gffread.log")]
-    if len(set(outputs)) != len(outputs) or sources.intersection(outputs):
-        parser.error("annotation, external BED12, output, report, and normalization paths must be distinct")
+        sources.append(args.bed12)
+    normalized = args.normalized_gtf or args.output + ".normalized.gtf"
+    outputs = [args.output, args.report, normalized, args.output + ".gffread.log"]
+    try:
+        protect_paths(sources, outputs)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     report = {"status": "failed", "annotation": str(Path(args.annotation)), "bed12": str(Path(args.output)),
               "external_bed12": args.bed12}
     try:
-        prepare_annotation(args.annotation, args.output, report, args.bed12)
+        # Remove old success artifacts only after proving none aliases an input.
+        for path in outputs:
+            Path(path).unlink(missing_ok=True)
+        prepare_annotation(args.annotation, args.output, report, args.bed12, args.normalized_gtf)
     except (ValueError, OSError) as exc:
+        report["status"] = "failed"
         report["error"] = str(exc)
+        Path(args.output).unlink(missing_ok=True)
+        Path(normalized).unlink(missing_ok=True)
         print(f"[ERROR] {exc}", file=sys.stderr)
-    report_path = Path(args.report)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_json(args.report, report)
     return 0 if report["status"] == "passed" else 1
 
 

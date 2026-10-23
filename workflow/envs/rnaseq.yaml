@@ -4,7 +4,7 @@ channels:
   - nodefaults
 dependencies:
   - python=3.11.9
-  - hisat2=2.2.2
+  - hisat2=2.2.1
   - samtools=1.20
   - stringtie=2.2.3
   - pandas=2.2.2

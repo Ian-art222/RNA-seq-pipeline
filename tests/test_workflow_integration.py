@@ -56,7 +56,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
         dispatcher = bindir / "python"
         dispatcher.write_text(
             "#!/bin/sh\ncase \"$1\" in\n"
-            "  */strandness.py) exec {} \"$@\" ;;\n"
+            "  */strandness.py|*/prepare_strand_bed.py|*/validate_bam_reference.py) exec {} \"$@\" ;;\n"
             "  *) exec {} \"$@\" ;;\nesac\n".format(
                 shlex.quote(sys.executable), shlex.quote(cls.workflow_python)
             )
@@ -97,6 +97,10 @@ class WorkflowIntegrationTests(unittest.TestCase):
                     feature, start + 1, start + 900, strand, attributes
                 ))
         annotation.write_text("".join(rows))
+        for i in range(1, 9):
+            index_file = workdir / f"unused_index.{i}.ht2"
+            index_file.write_text("fixture only: these tests start from BAM\n")
+            os.utime(index_file, (time.time() - 120, time.time() - 120))
         for sample, direction in samples.items():
             self.make_sample(workdir, sample, direction)
         config = {
@@ -120,15 +124,22 @@ class WorkflowIntegrationTests(unittest.TestCase):
 
     def make_sample(self, workdir, sample, direction):
         clean = workdir / "cleandata" / sample
-        clean.mkdir(parents=True)
+        clean.mkdir(parents=True, exist_ok=True)
         old_time = time.time() - 120
         for mate in (1, 2):
             fastq = clean / "{}_{}.clean.fastq.gz".format(sample, mate)
             with gzip.open(fastq, "wt") as handle:
                 handle.write("@placeholder/{}\n{}\n+\n{}\n".format(mate, "A" * 75, "I" * 75))
             os.utime(fastq, (old_time, old_time))
+        # Imported BAM fixture: measure its FASTQ fixture before publishing BAM.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("read_lengths", ROOT / "workflow/scripts/read_lengths.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        report = module.measure(sample, clean / (sample + "_1.clean.fastq.gz"), clean / (sample + "_2.clean.fastq.gz"))
+        module.atomic_json(workdir / "alignment/read_lengths" / (sample + ".json"), report)
         directory = workdir / "alignment" / sample
-        directory.mkdir(parents=True)
+        directory.mkdir(parents=True, exist_ok=True)
         unsorted = directory / "synthetic.unsorted.bam"
         bam_path = directory / (sample + ".sorted.bam")
         header = {"HD": {"VN": "1.6", "SO": "coordinate"},
@@ -172,7 +183,7 @@ class WorkflowIntegrationTests(unittest.TestCase):
     def run_workflow(self, workdir, dry_run=False, override=None):
         command = [self.snakemake, "--snakefile", str(ROOT / "workflow" / "Snakefile"),
                    "--directory", str(workdir), "--configfile", str(workdir / "config.yaml"),
-                   "--cores", "2", "--printshellcmds", "--rerun-triggers", "mtime"]
+                   "--cores", "2", "--printshellcmds"]
         if dry_run:
             command.append("--dry-run")
         if override is not None:
@@ -213,7 +224,8 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 workdir = self.make_case("dry-{}".format(enabled), {"sample": "fr"}, not enabled)
                 status, output = self.run_workflow(workdir, dry_run=True, override=str(enabled).lower())
                 self.assertEqual(status, 0, output[-10000:])
-                for rule in ("prepare_strand_bed", "infer_strandness", "strandness_gate"):
+                self.assertIn("prepare_reference", output)
+                for rule in ("infer_strandness", "strandness_gate"):
                     if enabled:
                         self.assertIn(rule, output)
                     else:
@@ -268,40 +280,84 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 self.assertEqual(report["usable_reads"], expected_reads)
                 self.assertAlmostEqual(report["dominant_fraction"], 1.0)
                 self.assertIn("STRINGTIE_STRAND=--" + direction,
-                              (quant / "strandness" / "strandness.env").read_text())
+                              (quant / "strandness" / "sample.env").read_text())
                 gtf = (quant / "sample" / "sample.gtf").read_text()
                 self.assertIn(" --" + direction + " ", gtf)
                 self.assertFalse((workdir / "quantification" / "gene_count_matrix.csv").exists())
 
-    def assert_gate_blocks_every_sample(self, name, samples):
-        workdir = self.make_case(name, samples, True)
+    def read_cohort_diagnostics(self, workdir):
+        diagnostic = workdir / "logs" / "stranded" / "strandness" / "strandness_diagnostic.tsv"
+        with diagnostic.open() as handle:
+            return {row["sample"]: row for row in csv.DictReader(handle, delimiter="\t")}
+
+    def test_opposite_protocols_use_each_samples_own_direction(self):
+        samples = {"forward": "fr", "reverse": "rf"}
+        workdir = self.make_case("mixed-protocols", samples, True)
+        status, output = self.run_workflow(workdir)
+        self.assertEqual(status, 0, output[-10000:])
+        self.assert_completed_matrices(workdir, samples, True)
+        quant = workdir / "quantification" / "stranded"
+        diagnostics = self.read_cohort_diagnostics(workdir)
+        for sample, direction in samples.items():
+            with self.subTest(sample=sample):
+                env = quant / "strandness" / (sample + ".env")
+                self.assertEqual(env.read_text().strip(), "STRINGTIE_STRAND=--" + direction)
+                gtf = (quant / sample / (sample + ".gtf")).read_text()
+                self.assertIn(" --" + direction + " ", gtf)
+                self.assertEqual(diagnostics[sample]["status"], "PASS")
+                self.assertEqual(diagnostics[sample]["stringtie_flag"], "--" + direction)
+        self.assertFalse((quant / "strandness" / "strandness.env").exists())
+
+    def test_ambiguous_sample_does_not_block_good_sample_with_default_profile(self):
+        # Do not pass --keep-going: the workflow's default profile must keep
+        # independent work running when a different sample's gate fails.
+        workdir = self.make_case("ambiguous", {"good": "fr", "balanced": "balanced"}, True)
         status, output = self.run_workflow(workdir)
         self.assertNotEqual(status, 0, output[-10000:])
         quant = workdir / "quantification" / "stranded"
-        self.assertFalse((quant / "strandness" / "strandness.env").exists())
-        for sample in samples:
-            self.assertFalse((quant / sample / (sample + ".gtf")).exists())
-            self.assertTrue((quant / "strandness" / (sample + ".json")).is_file())
-            logdir = workdir / "logs" / "stranded" / "strandness" / sample
-            self.assertTrue((logdir / "stdout.txt").is_file())
-            self.assertTrue((logdir / "stderr.txt").is_file())
-        diagnostic = workdir / "logs" / "stranded" / "strandness" / "strandness_diagnostic.tsv"
-        self.assertIn("FAIL", diagnostic.read_text())
-        self.assertTrue((diagnostic.parent / "gate.log").is_file())
-        self.assertNotIn("localrule stringtie_quant:", output)
-        return workdir
-
-    def test_opposite_protocols_block_the_whole_cohort(self):
-        workdir = self.assert_gate_blocks_every_sample("conflict", {"forward": "fr", "reverse": "rf"})
-        diagnostic = workdir / "logs" / "stranded" / "strandness" / "strandness_diagnostic.tsv"
-        self.assertIn("disagree", diagnostic.read_text())
-
-    def test_ambiguous_sample_blocks_good_sample_too(self):
-        workdir = self.assert_gate_blocks_every_sample("ambiguous", {"good": "fr", "balanced": "balanced"})
-        report_path = workdir / "quantification" / "stranded" / "strandness" / "balanced.json"
-        report = json.loads(report_path.read_text())
+        self.assertIn(" --fr ", (quant / "good" / "good.gtf").read_text())
+        self.assertTrue((quant / "good" / "good_abundance.tab").is_file())
+        self.assertIn("STRINGTIE_STRAND=--fr", (quant / "strandness" / "good.env").read_text())
+        self.assertFalse((quant / "strandness" / "balanced.env").exists())
+        self.assertFalse((quant / "balanced" / "balanced.gtf").exists())
+        self.assertFalse((quant / "gene_count_matrix.csv").exists())
+        self.assertFalse((quant / "gene_expression_matrices.xlsx").exists())
+        report = json.loads((quant / "strandness" / "balanced.json").read_text())
         self.assertEqual(report["status"], "FAIL")
         self.assertAlmostEqual(report["dominant_fraction"], 0.5)
+        for sample in ("good", "balanced"):
+            logdir = workdir / "logs" / "stranded" / "strandness" / sample
+            for filename in ("stdout.txt", "stderr.txt", "gate.log", "strandness_diagnostic.tsv"):
+                self.assertTrue((logdir / filename).is_file(), str(logdir / filename))
+        diagnostics = self.read_cohort_diagnostics(workdir)
+        self.assertEqual(diagnostics["good"]["status"], "PASS")
+        self.assertEqual(diagnostics["balanced"]["status"], "FAIL")
+
+    def test_changed_sample_does_not_rerun_completed_other_sample(self):
+        workdir = self.make_case("resume-isolated", {"good": "fr", "changed": "fr"}, True)
+        status, output = self.run_workflow(workdir)
+        self.assertEqual(status, 0, output[-10000:])
+        self.assert_completed_matrices(workdir, ["good", "changed"], True)
+        quant = workdir / "quantification" / "stranded"
+        preserved = [
+            quant / "good" / "good.gtf",
+            quant / "good" / "good_abundance.tab",
+            quant / "strandness" / "good.json",
+            quant / "strandness" / "good.env",
+        ]
+        original = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in preserved}
+        self.make_sample(workdir, "changed", "balanced")
+        status, output = self.run_workflow(workdir)
+        self.assertNotEqual(status, 0, output[-10000:])
+        changed = json.loads((quant / "strandness" / "changed.json").read_text())
+        self.assertEqual(changed["status"], "FAIL")
+        self.assertFalse((quant / "strandness" / "changed.env").exists())
+        for path in preserved:
+            with self.subTest(file=path.name):
+                self.assertEqual((path.stat().st_mtime_ns, path.read_bytes()), original[path])
+        diagnostics = self.read_cohort_diagnostics(workdir)
+        self.assertEqual(diagnostics["good"]["status"], "PASS")
+        self.assertEqual(diagnostics["changed"]["status"], "FAIL")
 
 
 if __name__ == "__main__":

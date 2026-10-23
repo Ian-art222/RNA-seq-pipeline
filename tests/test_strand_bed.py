@@ -1,5 +1,7 @@
 """Scientific validation tests for transcript BED12 preparation (standard library only)."""
 import importlib.util
+import contextlib
+import io
 import json
 import shutil
 import tempfile
@@ -184,18 +186,19 @@ class StrandBedTests(unittest.TestCase):
         code, report = self.run_prepare(source)
         self.assertEqual(report["source_models_with_explicit_exons"], 0)
         self.assertEqual(report["source_models_without_explicit_exons"], 1)
+        self.assertEqual(report["source_models_without_explicit_exon_ids"], ["tx1"])
         self.assertIn("gffread-normalized GFF3", report["exon_model_source"])
         self.assertEqual(report["conversion_exit_code"], 0)
-        normalized = Path(report["normalized_annotation"]).read_text()
         # gffread versions differ in whether CDS-only GFF3 produces exon records.
         # Accept only an actual normalized exon model, never silently infer one here.
-        if "\texon\t" in normalized:
-            self.assertEqual(code, 0, report)
+        if code == 0:
+            self.assertIn("\texon\t", Path(report["normalized_annotation"]).read_text())
             self.assertEqual(bed.read_bed12(self.output)[0]["blocks"], [(0, 50), (100, 150)])
         else:
             self.assertEqual(code, 1)
             self.assertIn("lack exon records", report["error"])
             self.assertFalse(self.output.exists())
+            self.assertFalse(Path(report["normalized_annotation"]).exists())
         self.assertTrue(Path(report["conversion_log"]).is_file())
         self.assertEqual(self.annotation.read_text(), source)
 
@@ -229,6 +232,135 @@ class StrandBedTests(unittest.TestCase):
             code, report = self.run_prepare(source)
         self.assertEqual(code, 0, report)
         self.assertEqual(bed.read_bed12(self.output)[0]["blocks"], [(0, 20)])
+
+    def test_gtf_gene_without_transcript_model_is_rejected(self):
+        source = gtf("exon", 1, 20)
+        source += 'chr1\ttest\tgene\t101\t200\t.\t+\t.\tgene_id "missing";\n'
+        code, report = self.run_prepare(source)
+        self.assertEqual(code, 1)
+        self.assertIn("gene(s) lack transcript/exon models (missing)", report["error"])
+
+    def test_declared_gtf_gene_coordinates_and_identity_must_match_models(self):
+        gene = 'chr1\ttest\tgene\t10\t100\t.\t+\t.\tgene_id "g1";\n'
+        for transcript, message in (
+            (gtf("exon", 10, 100, strand="-"), "chromosome/strand disagrees"),
+            (gtf("exon", 10, 100, chrom="chr2"), "chromosome/strand disagrees"),
+            (gtf("exon", 1, 20), "outside declared gene"),
+            (gtf("transcript", 1, 100) + gtf("exon", 10, 100), "outside declared gene"),
+        ):
+            for source in (gene + transcript, transcript + gene):
+                with self.subTest(source=source):
+                    code, report = self.run_prepare(source)
+                    self.assertEqual(code, 1)
+                    self.assertIn(message, report["error"])
+        code, report = self.run_prepare(gene + gtf("exon", 10, 20) + gtf("exon", 50, 100, "tx2"))
+        self.assertEqual(code, 0, report)
+
+    def test_multiple_gff3_gene_parents_cannot_silently_drop_a_gene(self):
+        self.annotation = self.root / "reference.gff3"
+        source = "chr1\ttest\tgene\t1\t150\t.\t+\t.\tID=g1\n"
+        source += "chr1\ttest\tgene\t1\t150\t.\t+\t.\tID=g2\n"
+        source += "chr1\ttest\tmRNA\t1\t150\t.\t+\t.\tID=tx1;Parent=g1,g2\n"
+        source += "chr1\ttest\texon\t1\t150\t.\t+\t.\tParent=tx1\n"
+        with patch.object(bed.subprocess, "run") as converter:
+            code, report = self.run_prepare(source)
+        self.assertEqual(code, 1)
+        self.assertIn("multiple Parent IDs", report["error"])
+        converter.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_declared_gff3_genes_checked_before_normalization_discards_them(self):
+        self.annotation = self.root / "reference.gff3"
+        gene = "chr1\ttest\tgene\t10\t100\t.\t+\t.\tID=g1\n"
+        for chrom, strand, start, end, message in (
+            ("chr2", "+", 10, 100, "chromosome/strand disagrees"),
+            ("chr1", "-", 10, 100, "chromosome/strand disagrees"),
+            ("chr1", "+", 1, 100, "outside declared gene"),
+            ("chr1", "+", 10, 101, "outside declared gene"),
+        ):
+            model = f"{chrom}\ttest\tmRNA\t{start}\t{end}\t.\t{strand}\t.\tID=tx1;Parent=g1\n"
+            model += f"{chrom}\ttest\texon\t{start}\t{end}\t.\t{strand}\t.\tParent=tx1\n"
+            for source in (gene + model, model + gene):
+                with self.subTest(source=source), patch.object(bed.subprocess, "run") as converter:
+                    code, report = self.run_prepare(source)
+                    self.assertEqual(code, 1)
+                    self.assertIn(message, report["error"])
+                    converter.assert_not_called()
+
+    def test_gtf_cds_and_utr_must_be_inside_exon_union(self):
+        exons = gtf("exon", 1, 20) + gtf("exon", 101, 120)
+        for feature in ("CDS", "five_prime_UTR", "three_prime_UTR"):
+            for left, right in ((21, 25), (10, 110), (101, 130)):
+                with self.subTest(feature=feature, interval=(left, right)):
+                    code, report = self.run_prepare(exons + gtf(feature, left, right))
+                    self.assertEqual(code, 1)
+                    self.assertIn("not contained in exon blocks", report["error"])
+            code, report = self.run_prepare(exons + gtf(feature, 5, 20) + gtf(feature, 101, 110))
+            self.assertEqual(code, 0, report)
+
+    def test_gff3_cds_cannot_extend_exons_during_normalization(self):
+        self.annotation = self.root / "reference.gff3"
+        source = "chr1\ttest\tmRNA\t1\t200\t.\t+\t.\tID=tx1;Parent=g1\n"
+        source += "chr1\ttest\texon\t1\t20\t.\t+\t.\tParent=tx1\n"
+        source += "chr1\ttest\tCDS\t101\t200\t.\t+\t0\tParent=tx1\n"
+        with patch.object(bed.subprocess, "run") as converter:
+            code, report = self.run_prepare(source)
+        self.assertEqual(code, 1)
+        self.assertIn("not contained in exon blocks", report["error"])
+        converter.assert_not_called()
+
+    def test_normalized_gtf_preserves_identifiers_and_source_exactly(self):
+        normalized = self.root / "quantification.gtf"
+        source = gtf("exon", 1, 20, tid="tx%3B1|isoform", gene="g1|original")
+        code, report = self.run_prepare(source, "--normalized-gtf", str(normalized))
+        self.assertEqual(code, 0, report)
+        self.assertEqual(normalized.read_bytes(), self.annotation.read_bytes())
+        self.assertEqual(bed.read_bed12(self.output)[0]["name"], "tx%3B1|isoform")
+        self.assertEqual(report["normalized_annotation"], str(normalized))
+
+    def test_failure_removes_stale_bed_normalized_gtf_and_pass_report(self):
+        normalized = self.root / "quantification.gtf"
+        args = ("--normalized-gtf", str(normalized))
+        self.assertEqual(self.run_prepare(gtf("exon", 1, 20), *args)[0], 0)
+        code, report = self.run_prepare(gtf("CDS", 1, 20), *args)
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "failed")
+        self.assertFalse(self.output.exists())
+        self.assertFalse(normalized.exists())
+
+    def test_outputs_cannot_alias_inputs_by_hardlink_or_symlink(self):
+        source = gtf("exon", 1, 20)
+        self.annotation.write_text(source)
+        for option in ("--report", "--normalized-gtf"):
+            for kind in ("hardlink", "symlink"):
+                with self.subTest(option=option, kind=kind):
+                    alias = self.root / "alias"
+                    if kind == "hardlink":
+                        alias.hardlink_to(self.annotation)
+                    else:
+                        alias.symlink_to(self.annotation)
+                    with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                        bed.main(["--annotation", str(self.annotation), "--output", str(self.output),
+                                  "--report", str(self.report), option, str(alias)])
+                    self.assertEqual(self.annotation.read_text(), source)
+                    self.assertFalse(self.output.exists())
+                    alias.unlink()
+
+    @unittest.skipUnless(shutil.which("gffread"), "gffread is unavailable on PATH")
+    def test_real_gffread_regulatory_gene_child_and_encoded_ids(self):
+        self.annotation = self.root / "reference.gff3"
+        normalized = self.root / "quantification.gtf"
+        source = "##gff-version 3\nchr1\ttest\tgene\t1\t300\t.\t+\t.\tID=g1|original\n"
+        source += "chr1\ttest\tTF_binding_site\t1\t10\t.\t+\t.\tID=tfbs1;Parent=g1|original\n"
+        source += "chr1\ttest\tmRNA\t51\t300\t.\t+\t.\tID=tx%3B1|isoform;Parent=g1|original\n"
+        source += "chr1\ttest\texon\t51\t300\t.\t+\t.\tParent=tx%3B1|isoform\n"
+        code, report = self.run_prepare(source, "--normalized-gtf", str(normalized))
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["source_transcript_model_count"], 1)
+        self.assertEqual(bed.read_bed12(self.output)[0]["name"], "tx%3B1|isoform")
+        self.assertIn('gene_id "g1|original"', normalized.read_text())
+        self.assertIn('transcript_id "tx%3B1|isoform"', normalized.read_text())
+        self.assertEqual(self.annotation.read_text(), source)
 
 
 if __name__ == "__main__":

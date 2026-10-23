@@ -1,0 +1,3 @@
+# Keep processing independent samples after a job fails. The overall workflow
+# still exits unsuccessfully; incomplete cohorts never produce new matrices.
+keep-going: true

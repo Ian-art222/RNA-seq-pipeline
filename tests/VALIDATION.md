@@ -1,51 +1,83 @@
-# 两分支升级验证记录
+# 修复与验证记录（2026-10-22）
 
-本次只使用人工注释、FASTQ 占位文件和合成 BAM；未运行真实样本，未修改已有分析结果，未下载或安装软件。
+目标源码：`/home/weiyuekuan/10.RNA-seq/4.RNA-seq-pipeline`。
 
-## 已通过的验证
+## 最终结果
 
-- 41 项脚本测试：18 项注释/BED12 测试，23 项判链/质量检查测试。包含真实 gffread 转换、真实 RSeQC 采满目标数量时的输出解析，以及 GFF3 子记录在转换前的坐标/链一致性检查。
-- 6 项工作流集成测试（10 次隔离的 Snakemake 调用）：普通与链特异性分支，非法/冲突配置，FR 与 RF，方向模糊与样本间方向冲突。
-- 成功场景实际运行 StringTie 2.2.3、prepDE、矩阵汇总与 Excel 导出；核对样本列、基因集合、正数表达值、TPM 总和及 Excel sheet。
-- 失败场景检查 Snakemake 非零退出、无放行文件、所有样本均未生成 StringTie GTF，且诊断 TSV 和原始 RSeQC 输出仍存在。
+统一执行 `python -m unittest discover -s tests -v`，开启真实 FASTQ 回归和所有已有工具覆盖：**117 项全部通过，无跳过项，耗时70.121秒**。
 
-| 人工输入 | 实际采样量 / 目标 | 判链结果 | 后续行为 |
-|---|---:|---|---|
-| FR | 1000 / 1000 | `--fr` | 完成矩阵和 Excel |
-| RF | 2400 / 200000 | `--rf`，采样不足警告 | 完成矩阵和 Excel |
-| 非链特异性，普通模式 | 不执行 RSeQC | 无链方向参数 | 完成矩阵和 Excel |
-| 两种方向约 1:1，链特异性模式 | 2400 / 200000 | FAIL | 阻断全部定量 |
-| 同批一个 FR、一个 RF | 每个 2400 / 200000 | 各自可判定，整批方向冲突 | 阻断全部定量 |
+| 测试文件 | 项数 | 验证内容 |
+|---|---:|---|
+| test_alignment_report.py | 18 | 必需字段、计数/比例一致性、可选 HISAT2 模式、样本 ID |
+| test_quantification.py | 25 | 单样本读长、canonical ID、GFF、重复记录、零表达、数值和 Excel |
+| test_read_lengths_and_resources.py | 11 | 全量双端均值、配对/截断错误、实际线程预算、剪接输入路径、失败传播 |
+| test_reference_validation.py | 6 | BAM/BAI、排序、参考序列/范围、旧成功状态清除 |
+| test_strand_bed.py | 25 | BED/GTF/GFF3 标准化、转义 ID、未建模基因、子特征、输出保护 |
+| test_strandness.py | 23 | FR/RF、质量门控、字段解析、真实 RSeQC、失败诊断 |
+| test_workflow_integration.py | 6 | 预建人工 BAM 的 FR/RF、普通模式、方向冲突/模糊、非法配置 |
+| test_workflow_regressions.py | 3 | 真实 FASTQ 两分支、默认重跑、索引/脚本/Ballgown、错误参考阻断 |
 
-脚本测试还包含缺失/重复比例、NaN/Infinity、非法范围、零采样/缺失计数、非双端结果、阈值边界、工具异常退出、BAM 与注释不兼容、旧放行文件失效等情形。
+[完整测试日志](/home/weiyuekuan/tmp/rnaseq-fix-20261022-221623/all-tests.log)。
 
-最后另作样本扫描检查：空 FASTQ 被拒绝，`strict=false` 仍能跳过不完整的非样本目录。
+## FASTQ 到 Excel 的真实工具回归
 
-## 验证环境和边界
+使用10 kb人工参考、两个基因（ID为 `001`、`Gene|literal`，都有 gene_name），两个样本（`001` 为75 bp，`NA` 为150 bp），各200对人工 reads。
 
-- Snakemake 9.19.0；RSeQC 5.0.4；pysam 0.24.0；gffread 0.12.9。
-- 定量与导出使用已有 workflow 缓存环境：Python 3.11.9、StringTie 2.2.3、pandas 2.2.2、openpyxl 3.1.5。
-- 判链测试使用本机 RNA-seq 环境的 Python 3.13.14；新增 Conda 定义使用 Python 3.11。本次没有创建/求解新的 Conda 环境，依赖安装不是此次验证范围。
-- 集成测试从预构建的人工 BAM 开始，HISAT2 比对没有重新执行；这次改动的两分支及下游路径已实际执行。
-- gffread 对仅 CDS 的测试注释未输出 exon，因此流程正确拒绝该注释；没有以 transcript 跨度静默补 exon。
+- 普通模式：`--cores 1`，工作目录包含空格及单引号；HISAT2、view、sort顺序执行，单阶段不超预算。
+- 链特异模式：`--cores 4`，真实RSeQC通过FR门控，流水线线程之和不超预算。
+- 两种模式最终矩阵均为下表，且与 canonical raw count 逐单元一致；150 bp样本按实际读长独立重算一致，与默认75 bp计算不同。
 
-集成测试使用临时目录中的 `rnaseq-strand-integration-*` 工作目录；设置 `RNASEQ_TEST_KEEP=1` 可保留并查看测试打印的实际路径。每个场景含 `snakemake.run.log` 或 `snakemake.dry-run.log`；链特异性场景的详细报告在 `logs/stranded/strandness/`。
+| GeneID | 样本001（75 bp） | 样本NA（150 bp） |
+|---|---:|---:|
+| 001 | 201 | 201 |
+| Gene\|literal | 201 | 201 |
 
-## 重复运行
+每个基因每样本100对reads，即200条reads；覆盖度输出精度与ceil使估算值为201。这验证的是相同覆盖度公式、正确单条read长度以及ID映射，不将估算count冒充精确fragment count。
 
-脚本测试（真实工具不在 PATH 时，其对应可选测试会跳过）：
+每样本TPM总和约100万；Excel的ID、样本名、列名均保持文本，所有数值与CSV一致。完整测试目录保留在：
+
+- [普通分支](</home/weiyuekuan/tmp/rnaseq-fastq-regressions-iwydbmwr/unstranded work 'quoted'>)
+- [链特异分支](</home/weiyuekuan/tmp/rnaseq-fastq-regressions-iwydbmwr/stranded work>)
+
+使用默认 Snakemake rerun triggers 实测：无变动时无需重跑；删除Ballgown文件会重建；修改矩阵脚本的实际代码后会重算矩阵；修改索引副本内容后会重新安排比对；缺少索引在DAG阶段失败。普通模式也会因注释contig不属于BAM而阻断StringTie。
+
+## 其他独立核实
+
+- 原prepDE默认CLI与修复版默认CLI，在三组真实StringTie合成GTF（gene_name、GFF3 ncRNA、分离bundle）上的gene/transcript count逐单元相同。pipeline通过新增选项切换canonical ID和每样本读长，计数公式保持不变。证据：[旧版等价检查](/home/weiyuekuan/tmp/prepde-legacy-equivalence-v1ch6hhl)。
+- 真实HISAT2的标准、`--no-mixed`、`--no-discordant`及并用模式，含未比对mate的summary均通过新解析器检查。证据：[summary模式检查](/home/weiyuekuan/tmp/hisat-summary-mixed-3fwyxn_3)。
+- 独立验证含空格/单引号目录、cores1/3、索引/脚本依赖；HISAT2内部再次拼接shell的路径问题由安全相对别名修复。证据：[独立流程回归](/home/weiyuekuan/tmp/rnaseq-independent-fix-p071q193)。
+- 相对剪接文件 `--known-splicesite-infile "known sites.ss"` 在带单引号workdir中实际比对成功；原workdir路径先解析，再创建临时别名，且列入DAG。证据：[剪接输入检查](/home/weiyuekuan/tmp/rnaseq-fix-20261022-221623/splice-check)。
+- 当前默认参考已迁移至 `/home/weiyuekuan/3.hista2_reference/`。FASTA与索引的12条序列名/长度一致，共1,093,552,602 bp；GTF 396,289条记录的序列与坐标全部兼容。新版BED准备与矩阵注释解析均通过：39,686转录本/基因模型，12条染色体。证据：[参考准备报告](/home/weiyuekuan/tmp/rnaseq-fix-20261022-221623/reference-validation/report.json)。这些检查未替代参考来源或逐碱基组装一致性证明。
+
+## 工具版本与边界
+
+本次复用现有工具，没有下载或安装依赖：
+
+- Snakemake 9.19.0。
+- HISAT2 2.2.1、StringTie 2.2.3，均使用现有缓存可执行文件，与YAML的这两个版本一致。
+- samtools 1.23.1、RSeQC 5.0.4、pysam 0.24.0、gffread 0.12.9。
+- 测试/判链Python 3.13；矩阵/Excel子进程Python 3.8.20，openpyxl 3.1.5。矩阵和Excel脚本现不再依赖pandas的自动类型推断。
+
+未新建整套Conda环境，因此不宣称已验证完整YAML依赖求解或全部固定版本组合（YAML中samtools为1.20、Python为3.11.9）。本次仅运行人工数据和参考只读验证，没有重算真实样本，没有修改真实参考文件或历史分析结果。
+
+源代码修改前备份：[source-before](/home/weiyuekuan/tmp/rnaseq-fix-20261022-221623/source-before)。详细修复清单、差异和指纹保存在同级审查目录。
+
+## 重复执行
+
+使用含pysam的Python运行测试，设置已有工具路径和包含openpyxl的量化Python：
 
 ```bash
-python -m unittest discover -s tests -p 'test_strand*.py' -v
-```
-
-工作流集成测试用含 pysam 的 Python 执行，可通过环境变量选择现有工具。`RNASEQ_TEST_WORKFLOW_PYTHON` 需包含 pandas/openpyxl；测试会用临时命令分派复现两层业务环境，不安装依赖。
-
-```bash
-RNASEQ_TEST_SNAKEMAKE=/path/to/snakemake \
-RNASEQ_TEST_RSEQC=/path/to/infer_experiment.py \
-RNASEQ_TEST_STRINGTIE=/path/to/stringtie \
-RNASEQ_TEST_WORKFLOW_PYTHON=/path/to/quantification/python \
+RNASEQ_TEST_FULL_FASTQ=1 \
 RNASEQ_TEST_KEEP=1 \
-/path/to/pysam/python -m unittest discover -s tests -p test_workflow_integration.py -v
+RNASEQ_TEST_SNAKEMAKE=/path/to/snakemake \
+RNASEQ_TEST_HISAT2=/path/to/hisat2 \
+RNASEQ_TEST_HISAT2_BUILD=/path/to/hisat2-build \
+RNASEQ_TEST_SAMTOOLS=/path/to/samtools \
+RNASEQ_TEST_STRINGTIE=/path/to/stringtie \
+RNASEQ_TEST_RSEQC=/path/to/infer_experiment.py \
+RNASEQ_TEST_GFFREAD=/path/to/gffread \
+RNASEQ_TEST_WORKFLOW_PYTHON=/path/to/quantification/python \
+/path/to/pysam/python -m unittest discover -s tests -v
 ```
+
+`test_strand_bed.py`和`test_strandness.py`的真实工具测试也要求gffread/infer_experiment.py在PATH。未满足工具条件的测试会显示skip，不能算作验证通过。

@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import csv
 import io
 import json
 import os
@@ -122,6 +123,16 @@ class FileTests(unittest.TestCase):
             diagnostic=str(self.path / "diagnostic.tsv"), output=str(self.path / "strandness.env"),
         ))
 
+    def summarize(self, reports, samples=None):
+        return strandness.summarize(argparse.Namespace(
+            samples=["sample1", "sample2"] if samples is None else samples,
+            reports=reports, diagnostic=str(self.path / "diagnostic.tsv"),
+        ))
+
+    def diagnostic(self):
+        with (self.path / "diagnostic.tsv").open(newline="") as handle:
+            return list(csv.DictReader(handle, delimiter="\t"))
+
     def test_gate_all_pass(self):
         reports = [self.write_report(sample, parsed(sample)) for sample in ("sample1", "sample2")]
         self.assertEqual(self.gate(reports), 0)
@@ -156,6 +167,90 @@ class FileTests(unittest.TestCase):
                 report.update(mutation)
                 bad = self.write_report("two", report)
                 self.assertEqual(self.gate([good, bad]), 1)
+
+    def test_summary_accepts_mixed_directions_without_creating_env(self):
+        first = parsed("sample1")
+        first["warnings"] = ["Original sampling warning"]
+        reports = [self.write_report("one", first), self.write_report("two", parsed("sample2", mode1="0.91", mode2="0.04"))]
+        with contextlib.redirect_stderr(io.StringIO()) as captured:
+            self.assertEqual(self.summarize(reports), 0)
+        self.assertIn("mixed FR/RF", captured.getvalue())
+        rows = self.diagnostic()
+        self.assertEqual([row["status"] for row in rows], ["PASS", "PASS"])
+        self.assertEqual([row["stringtie_flag"] for row in rows], ["--rf", "--fr"])
+        self.assertEqual(rows[0]["warnings"], "Original sampling warning")
+        self.assertEqual(rows[0]["mode2"], "0.91")
+        self.assertEqual(rows[0]["usable_reads"], "200000")
+        self.assertFalse((self.path / "strandness.env").exists())
+
+    def test_summary_preserves_failed_evidence_without_blocking_good_sample(self):
+        good = self.write_report("one", parsed("sample1"))
+        failed = parsed("sample2", mode1="0.5", mode2="0.45")
+        cases = [failed]
+        for mutation in [{"usable_reads": 0}, {"stringtie_flag": "--fr"}, {"mode2": 0.5}, {"protocol": "SingleEnd"}, {"tool": {"returncode": 1}}]:
+            report = parsed("sample2")
+            report.update(mutation)
+            cases.append(report)
+        for report in cases:
+            with self.subTest(report=report):
+                bad = self.write_report("two", report)
+                with contextlib.redirect_stderr(io.StringIO()) as captured:
+                    self.assertEqual(self.summarize([good, bad]), 0)
+                rows = self.diagnostic()
+                self.assertEqual([row["status"] for row in rows], ["PASS", "FAIL"])
+                self.assertEqual(float(rows[1]["mode1"]), report["mode1"])
+                self.assertEqual(float(rows[1]["mode2"]), report["mode2"])
+                self.assertTrue(rows[1]["reason"])
+                self.assertIn("per-sample gates", captured.getvalue())
+                self.assertEqual(self.gate([good], samples=["sample1"]), 0)
+                self.assertEqual((self.path / "strandness.env").read_text(), "STRINGTIE_STRAND=--rf\n")
+
+    def test_summary_rejects_structural_defects_and_retains_diagnostic(self):
+        good = self.write_report("one", parsed("sample1"))
+        corrupt = self.path / "corrupt.json"
+        corrupt.write_text("{not json}")
+        cases = [
+            ([good], None),
+            ([good, good], None),
+            ([good, good], ["sample1", "sample1"]),
+            ([good, str(self.path / "missing.json")], None),
+            ([good, str(corrupt)], None),
+            ([good, good], ["sample1"]),
+            ([], []),
+            ([good], ["bad\tname"]),
+        ]
+        for reports, samples in cases:
+            with self.subTest(reports=reports, samples=samples), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.summarize(reports, samples), 1)
+                rows = self.diagnostic()
+                self.assertEqual(rows[-1]["sample"], "__summary__")
+                self.assertEqual(rows[-1]["status"], "FAIL")
+                self.assertTrue(rows[-1]["reason"])
+
+    def test_summary_cannot_overwrite_report_or_its_alias(self):
+        report = Path(self.write_report("one", parsed("sample1")))
+        before = report.read_bytes()
+        for diagnostic in [report, self.path / "hardlink.tsv", self.path / "symlink.tsv"]:
+            if diagnostic.name == "hardlink.tsv":
+                os.link(report, diagnostic)
+            elif diagnostic.name == "symlink.tsv":
+                diagnostic.symlink_to(report)
+            args = argparse.Namespace(samples=["sample1"], reports=[str(report)], diagnostic=str(diagnostic))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(strandness.summarize(args), 1)
+            self.assertEqual(report.read_bytes(), before)
+
+    def test_summary_cli_is_available_and_keeps_existing_env(self):
+        report = self.write_report("one", parsed("sample1"))
+        env = self.path / "strandness.env"
+        env.write_text("STRINGTIE_STRAND=--fr\n")
+        completed = subprocess.run([
+            sys.executable, strandness.__file__, "summarize", "--samples", "sample1",
+            "--reports", report, "--diagnostic", str(self.path / "diagnostic.tsv"),
+        ], capture_output=True, text=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.diagnostic()[0]["status"], "PASS")
+        self.assertEqual(env.read_text(), "STRINGTIE_STRAND=--fr\n")
 
     def test_option_allows_only_the_exact_assignment(self):
         env = self.path / "strandness.env"
@@ -299,6 +394,45 @@ class FileTests(unittest.TestCase):
         pysam.index(str(bam))
         with self.assertRaisesRegex(ValueError, "--rna-strandness"):
             strandness.validate_inputs(bam, str(bam) + ".bai", bed)
+
+    def test_real_rseqc_samples_records_in_order_and_uses_transcript_spans(self):
+        if not shutil.which("infer_experiment.py"):
+            self.skipTest("RSeQC is only required in the RNA-seq runtime environment")
+        try:
+            import pysam
+        except ImportError:
+            self.skipTest("pysam is only required in the RNA-seq runtime environment")
+        args = self.infer_args()
+        bam, bed = self.path / "sampling.bam", self.path / "sampling.bed"
+        header = {"HD": {"VN": "1.6", "SO": "coordinate"}, "SQ": [{"SN": "chr1", "LN": 1000}]}
+        with pysam.AlignmentFile(str(bam), "wb", header=header) as handle:
+            # Initial intergenic records are excluded. The first two overlapping
+            # records are intronic RF mates, followed by exonic FR mates. A
+            # two-record sample must therefore call RF, not exonic FR or mixed.
+            for index, (start, flag) in enumerate(((0, 65), (30, 145), (200, 81), (250, 161), (480, 65), (481, 145))):
+                read = pysam.AlignedSegment()
+                read.query_name = "pair{}".format(index // 2)
+                read.query_sequence = "A" * 10
+                read.flag = flag
+                read.reference_id = 0
+                read.reference_start = start
+                read.mapping_quality = 60
+                read.cigarstring = "10M"
+                read.next_reference_id = 0
+                read.next_reference_start = start
+                handle.write(read)
+        pysam.index(str(bam))
+        bed.write_text("chr1\t100\t500\tt1\t0\t+\t100\t100\t0\t2\t20,20,\t0,380,\n")
+        args.bam, args.bai, args.bed12 = str(bam), str(bam) + ".bai", str(bed)
+        args.sample_size = 2
+        self.assertEqual(strandness.infer(args), 0)
+        report = json.loads(Path(args.output).read_text())
+        self.assertEqual(report["status"], "PASS", report["errors"])
+        self.assertEqual(report["usable_reads"], 2)
+        self.assertEqual(report["stringtie_flag"], "--rf")
+        if "5.0.4" in report["tool"]["version"]:
+            self.assertIn("not random", report["sampling"]["selection"])
+            self.assertIn("including introns", report["sampling"]["overlap"])
 
 
 if __name__ == "__main__":

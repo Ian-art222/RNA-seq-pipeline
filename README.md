@@ -1,351 +1,285 @@
-# RNA-seq Snakemake Pipeline
+# RNA-seq Snakemake pipeline
 
-## 链特异性定量开关
+2026-10-23 恢复版：在 GitHub 原版基础上恢复本次对话中的全部修复、fastp 清洗及样本独立执行改进，源码移至 `/home/weiyuekuan/12.Snakemake/RNA-seq-pipeline`。比对 BAM 的默认 `alignment.mapq_filter` 改为 `0`，RSeQC 判链的独立阈值 `strandness.mapq` 仍为 `30`。本次恢复与复验记录见 [tests/RESTORED_VALIDATION_20261023.md](tests/RESTORED_VALIDATION_20261023.md)。
 
-输入仍为同一参考下的双端 clean FASTQ。运行前设置配置文件中的 `stranded`，或在原运行命令末尾添加 `--config stranded=true` / `--config stranded=false`。省略该字段时默认 `false`，字符串 `false` 也会正确解析；其他取值报错。
+本轮完整回归 164 项全部通过，0 失败、0 错误、0 跳过；使用人工 FASTQ/BAM 和现有软件环境验证，真实参考另做只读兼容检查。
 
-- `stranded: false`：HISAT2 → 排序/索引 → StringTie 普通定量 → 原有矩阵与 Excel。
-- `stranded: true`：HISAT2 → 排序/索引 → RSeQC 逐样本判链 → 全样本质量检查 → StringTie `--fr` / `--rf` 定量 → 矩阵与 Excel。
+双端 raw FASTQ → 可选 fastp 清洗 → clean FASTQ → HISAT2 → 排序/索引 BAM → 参考兼容检查 → StringTie `-G -e` → read count 估计、FPKM、TPM 和 Excel。默认从已有 clean FASTQ 开始；可在配置中启用 fastp 并明确指定是否修剪 polyG。输入必须属于同一个参考基因组；不进行新转录本发现或差异表达统计。
 
-两条路共享不预设链方向的 `HISAT2 --dta` 比对。开启判链时，`alignment.hisat2_extra` 不得包含 `--rna-strandness`；已有 BAM 的 HISAT2 命令记录也会检查。StringTie 的 `--fr` / `--rf` 统一由开关与判链结果管理，不要写入 `stringtie.extra`。每个样本独立判链，所有样本通过且方向一致后才允许任何样本进入链特异性定量。混合建库协议请按协议拆成独立任务。
+2026-10-23 样本独立执行更新：已将判链改为逐样本放行，默认继续执行其他无失败依赖的任务；故障隔离、修复续跑及结果复用的验证见 [tests/SAMPLE_ISOLATION_20261023.md](tests/SAMPLE_ISOLATION_20261023.md)。
+
+## 2026-10-23 全面复审
+
+本轮修复比对参数绕过、StringTie额外BAM输入/点特征依赖、冗余零转录本汇总、GFF3多归属与gene声明冲突、全DAG输入输出保护、损坏summary及Excel整数校验。155项测试全部通过；主流程固定版本环境已离线创建并用于验证。详细证据和未覆盖的环境/科学边界见 [tests/FULL_AUDIT_20261023.md](tests/FULL_AUDIT_20261023.md)。
+
+## 2026-10-22 修复
+
+- 从每个样本两端完整 clean FASTQ 流式统计实际平均 read 长度，分别用于 prepDE，取消 pipeline 隐含的固定 75 bp。计算同时检查 FASTQ 结构、两端记录数及 read ID 配对。
+- pipeline 的 prepDE 输出使用原始 `gene_id`，保留 ID 中的 `|`，不会拼接 gene_name，也不靠截断字符串猜测映射。
+- 两种模式均标准化并验证注释，且验证 BAM/BAI 与注释序列和坐标。缺少 exon 模型的基因不能作为零表达进入矩阵。
+- 支持 GFF3 的 ncRNA_gene 等类型；忽略不属于转录本的普通 gene 子特征；一致保留转义 ID。
+- 汇总严格检查基因/样本集合、数值、TPM 总和；合法的同基因、同链、不同区间 abundance 记录聚合，冲突或重复重叠记录报错。
+- 索引、辅助脚本、额外剪接位点输入和 Ballgown 文件列入依赖图，修改或丢失后可触发重建。
+- 实际线程分配服从 Snakemake 预算，路径引用和 HISAT2 包装器内部路径处理支持空格及单引号。
+- Excel 中基因 ID、样本 ID、列名固定为文本，保留 `001`、`NA` 和 `|`。导出后重新打开检查表结构和数值。
+- 默认参考位置已更新为当前 `/home/weiyuekuan/3.hista2_reference/`，运行示例改用本源码目录。
+
+完整修复测试见 [tests/VALIDATION.md](tests/VALIDATION.md)。旧版本已经生成的矩阵不会在此次代码修复中自动改写；需要在选定 workdir 中检查 dry-run 并执行相应重算。
+
+## 源码和运行目录
+
+源码目录：`/home/weiyuekuan/12.Snakemake/RNA-seq-pipeline`。源码包含 workflow、config、tests；数据和分析结果放在独立的运行目录，用 `--directory` 指定。
+
+```text
+workdir/
+├── rawdata/                         # fastp.enabled=true 时的输入
+│   ├── sampleA/
+│   │   ├── sampleA_1.fastq.gz
+│   │   └── sampleA_2.fastq.gz
+│   └── sampleB/
+│       ├── sampleB_1.fastq.gz
+│       └── sampleB_2.fastq.gz
+├── cleandata/
+│   ├── sampleA/
+│   │   ├── sampleA_1.clean.fastq.gz
+│   │   └── sampleA_2.clean.fastq.gz
+│   └── sampleB/
+│       ├── sampleB_1.clean.fastq.gz
+│       └── sampleB_2.clean.fastq.gz
+├── qc/fastp/                        # 启用 fastp 时生成 HTML/JSON
+├── alignment/
+├── quantification/
+├── logs/
+└── .snakemake/
+```
+
+`fastp.enabled: false` 时仅扫描 cleandata 下一级样本子目录；设为 true 时改为扫描 rawdata 下一级样本子目录，并自动生成 cleandata，无需预先创建 clean 文件。目录名就是样本名，允许字母、数字、下划线、点、连字符，首字符不能是点或连字符。每个样本必须有一对非空 FASTQ；多个 lane 应先按相应样本正确合并。两种扫描分别使用 `sample_scan` 和 `raw_sample_scan` 的后缀及 `strict` 设置。`strict: true` 会拒绝不完整子目录；设为 false 时明确报告并跳过。普通文件会被忽略，平铺 FASTQ 需先放入对应样本子目录。
+
+FASTQ 支持标准四行记录、gzip 或纯文本（按后缀选择解压）；R1/R2 后缀可配置。每个 read 的序列和质量长度必须一致，配对 ID 可使用 `/1`、`/2` 或 Illumina mate 字段。全量读长统计使用常量内存，但会增加一次读取 FASTQ 的 I/O。
+
+## 配置
+
+修改 `config/config.yaml` 或使用额外配置文件。相对路径都相对于 `--directory` 的 workdir。
 
 ```yaml
-stranded: true
+stranded: false
+fastp:
+  enabled: false
+  trim_poly_g: false
+  qualified_quality_phred: 20
+  unqualified_percent_limit: 30
+  n_base_limit: 5
+  length_required: 40
+paths:
+  raw_dir: rawdata
+  qc_dir: qc/fastp
+  clean_dir: cleandata
+  align_dir: alignment
+  quant_dir: quantification
+  logs_dir: logs
+reference:
+  hisat2_index_prefix: /home/weiyuekuan/3.hista2_reference/CtZJ_T2T_index
+  annotation: /home/weiyuekuan/3.hista2_reference/CtZJ_T2T_gene.gtf
+alignment:
+  mapq_filter: 0
+  hisat2_extra: ""
+stringtie:
+  use_ballgown: true
+  extra: ""
+raw_sample_scan:
+  r1_suffix: _1.fastq.gz
+  r2_suffix: _2.fastq.gz
+  strict: true
+sample_scan:
+  r1_suffix: _1.clean.fastq.gz
+  r2_suffix: _2.clean.fastq.gz
+  strict: true
+threads:
+  fastp: 8
+```
+
+### fastp 清洗与 polyG 开关
+
+将 `fastp.enabled` 改为 true 后，每个样本运行 `--detect_adapter_for_pe -q 20 -u 30 -n 5 -l 40`，生成成对 clean FASTQ 及 HTML、JSON 报告。以上质量阈值均可在 `fastp` 配置项中修改，`threads.fastp` 默认为8；传给 `-w` 的工作线程数不超过 Snakemake 分配的预算，fastp 自身还会使用 I/O 辅助线程。输出名称继续使用 `sample_scan` 后缀，例如 `cleandata/sampleA/sampleA_1.clean.fastq.gz`，后续规则自动使用这些文件。
+
+- `trim_poly_g: true`：显式传入 `--trim_poly_g`。
+- `trim_poly_g: false`：显式传入 `--disable_trim_poly_g`，确保关闭。仅省略 `--trim_poly_g` 并不保证关闭，因为 fastp 可以根据 FASTQ 仪器 ID 自动启用；参见 [fastp 官方 polyG 说明](https://github.com/OpenGene/fastp#polyg-tail-trimming)。
+
+polyG 设置在本次运行的所有样本间统一。如果样本来自不同平台且需要不同策略，应按策略分别建立运行目录与配置。raw、clean 和 QC 输出目录必须互不重叠，输入与输出也不得链接到同一文件。
+
+`-q 20 -u 30` 用来判断整条 read 的低质量碱基比例；`-n 5` 和 `-l 40` 分别过滤 N 过多和长度不足的 reads。这些参数不等同于按质量窗口剪切末端碱基。本流程保留给定命令的行为，不额外启用 `--cut_front`、`--cut_tail` 或 `--cut_right`；参见 [fastp 官方质量修剪说明](https://github.com/OpenGene/fastp#per-read-cutting-by-quality-score)。
+
+清洗前会完整校验 raw FASTQ 的结构、read ID 和两端记录数，避免过滤掩盖原始配对错误。fastp 成功且报告读数与输入一致后才发布 clean FASTQ 和报告；若全部 reads 被过滤，保留质控报告并在后续读长检查处停止，不进入比对。
+
+已有 clean 数据继续保持 `fastp.enabled: false` 即可；该模式不要求 rawdata 或 fastp 环境。切换清洗策略前，应检查 dry-run 中列出的重算范围。
+
+索引必须是该参考的完整、非空 8 个 `.ht2` 或 8 个 `.ht2l` 文件，不能把前缀写成目录，也不能混放两种格式。不存在、不完整或混合索引在建立 DAG 时立即报错。参考注释必须存在且非空；GTF 需要显式 exon 模型，GFF3 会经 gffread 转换后检查。有 gene 声明时，其染色体、链和范围必须与子模型一致；不能无损表示为单一 gene_id 的 GFF3 多 gene Parent 会在转换前被拒绝，避免静默丢失基因。注释与索引必须来自同一组装；序列名/长度/坐标通过只能说明结构兼容，不能单独证明组装来源一致。
+
+`alignment.mapq_filter` 默认为 `0`，不按 MAPQ 过滤比对 BAM；需要时可设为正整数，例如 `30` 保留 MAPQ≥30 的记录。该设置会影响多重比对相关的基因表达；HISAT2 summary 是过滤前统计，不代表最终保留 BAM 的有效定量比例。RSeQC 使用独立的 `strandness.mapq`（默认 `30`）选择判链证据，不会据此裁剪用于 StringTie 定量的 BAM。
+
+`hisat2_extra` 和 `stringtie.extra` 只用于未被流程管理的选项。不能覆盖线程、参考、输入、输出、定量模式或链方向；不支持改变 summary 格式以及在 HISAT2 extra 中另行生成未被规则追踪的输出。`--known-splicesite-infile`、`--novel-splicesite-infile` 支持相对/绝对路径和空格，按 workdir 解析并登记依赖。HISAT2 extra 禁止再次裁剪（`-3/-5/--trim3/--trim5`）、跳读/抽样和手动 `--rna-strandness`，使比对输入与统计 clean 读长保持一致。StringTie extra 禁止添加额外 BAM 或切换模式；支持的 `--ptf` 点特征文件会按 workdir 解析并列入依赖，修改后重跑定量。额外参数先按 shell 风格解析，再安全传递，不作为任意 shell 命令执行。
+
+## 两种定量模式
+
+- `stranded: false`：不执行判链，不给 StringTie 添加 `--fr/--rf`。仍执行 FASTQ、参考注释和 BAM 兼容检查。
+- `stranded: true`：每个样本独立执行 RSeQC 和质量门控，达标后立即按自己的方向进行链特异定量；失败只阻断该样本，不会退回普通模式。
+
+两条分支共享未预设链方向的 HISAT2 `--dta` 比对。开启自动判链时，HISAT2 配置和已有 BAM 的命令记录不得带 `--rna-strandness`。StringTie 方向由流程统一管理。
+
+```yaml
 strandness:
   sample_size: 200000
   mapq: 30
   min_determinable: 0.50
   min_dominance: 0.80
-  bed12: ""  # 空值：从 reference.annotation 自动生成
+  bed12: ""
 ```
 
-`mode1` 为 `1++,1--,2+-,2-+` 的比例，`mode2` 为 `1+-,1-+,2++,2--` 的比例。保留原判定规则：`mode1 + mode2 >= 0.50` 且 `max(mode1, mode2)/(mode1 + mode2) >= 0.80`；mode1 占优用 `--fr`，mode2 占优用 `--rf`。这是本流程采用的阈值，不是 RSeQC 的通用质量标准。
+`bed12` 留空时从注释生成。提供外部 BED12 时必须和同一注释的转录本 ID、位置、链及 exon blocks 一致。
 
-`-s 200000` 是目标采样量。报告会记录 RSeQC stderr 中实际 usable reads 数；实际数量为零、数量缺失或超出目标时判链失败，正数但不足目标时记录警告，不另加未约定的读数阈值。接近判定边界或可用 reads 很少时，应结合原始报告复核。RSeQC 5.0.4 按 BAM 顺序读取符合条件的记录，不是全基因组随机抽样；两种模式之和也不是全部 reads 的注释率。
+- mode1：`1++,1--,2+-,2-+`，优势方向对应 fr-secondstrand、StringTie `--fr`。
+- mode2：`1+-,1-+,2++,2--`，优势方向对应 fr-firststrand、StringTie `--rf`。
+- 每个样本的放行要求：`mode1 + mode2 >= 0.50` 且 `max(mode1,mode2)/(mode1+mode2) >= 0.80`。
 
-### 注释与输入检查
+这些是本流程阈值，不是 RSeQC 通用标准。记录实际 usable reads、原始比例、工具版本和命令；无采样、非双端、字段缺失/重复、非法数值或证据与记录方向冲突均阻断该样本。少于目标但大于零会警告，不额外加入最低读数阈值。RSeQC 5.0.4 按 BAM 顺序取前 N 条合格 alignment，PE 两端分别计数；它用转录本完整区间（包含 intron）判断重叠，不按 exon blocks 采样，也不是全基因组随机抽样。这些边界写入判链 JSON；比例不能解释成全部 reads 的注释率。
 
-开启链特异性模式后，流程从同一 `reference.annotation` 生成 BED12：GTF 逐转录本使用 exon 坐标；GFF/GFF3 先经 gffread 转为 GTF，保留转换文件和日志。缺少 exon 的模型、无效坐标或不一致的转录本信息会明确报错，避免静默丢失模型。如果设置 `strandness.bed12`，会校验 BED12 并与当前注释的转录本模型核对。注释和 BAM 必须来自同一组装；序列名称、坐标检查通过不能单独证明组装版本相同。
+合格样本的 FR/RF 方向可以不同，分别使用 `--fr` / `--rf`。汇总 TSV 保留每个样本的原始比例、方向和状态，混合方向会在汇总日志中警告；应结合实际建库信息核查。该汇总不控制单样本放行。命令行脚本 `strandness.py gate` 保留多样本严格一致性校验供独立调用，但本 workflow 每次只向它传入一个样本。
 
-判链前检查 BAM/BAI 可读性、排序信息和 BED12 对 BAM 序列名称/长度的兼容性。RSeQC 必须正常退出、识别为 PairEnd，并完整输出两种比例、无法判定比例和实际采样数；缺失/重复字段、非有限数值或非法范围均失败。`NA`、比例不达标或样本间方向冲突会使质量检查规则以非零状态退出，停止后续 StringTie，不自动改用普通定量。
+## 样本独立执行
 
-### 输出位置与重跑
+每个样本有独立的 fastp、读长检查、比对、索引、BAM 检查、判链和 StringTie 任务，以及各自的输出、日志和临时文件。一个样本完成前置步骤后即可继续，不必等其他样本；每一步由单独的作业进程执行，比对步骤还包含 HISAT2 与 samtools 子进程。
 
-普通模式继续输出到配置的 `paths.quant_dir` 和 `output.xlsx`。链特异性模式自动在两者所属位置增加 `stranded/` 子目录，避免覆盖普通定量结果。默认路径为：
+`workflow/profiles/default/config.yaml` 默认启用 `keep-going: true`。运行时某个样本失败，其他没有失败依赖的任务仍继续，整体运行最终返回非零退出码。启动示例也显式使用 `--keep-going`，以免自定义 profile 覆盖默认设置。修复失败原因后在同一运行目录重跑，已成功且输入、参数和代码未变化的任务可以复用。
 
-```text
-quantification/stranded/{sample}/{sample}.gtf
-quantification/stranded/{sample}/{sample}_abundance.tab
-quantification/stranded/gene_count_matrix.csv
-quantification/stranded/gene_fpkm_matrix.csv
-quantification/stranded/gene_tpm_matrix.csv
-quantification/stranded/gene_expression_matrices.xlsx
-quantification/stranded/strandness/reference.bed12
-quantification/stranded/strandness/{sample}.json
-quantification/stranded/strandness/strandness.env
-logs/stranded/strandness/prepare_bed.json
-logs/stranded/strandness/{sample}/
-logs/stranded/strandness/strandness_diagnostic.tsv
-logs/stranded/strandness/gate.log
+样本独立执行不改变以下依赖：
+
+- 启动前仍检查配置、样本名、输入输出冲突及配对文件是否存在且非空。默认 `strict: true` 下缺失 FASTQ 会阻止建立任务图；文件内容错误则由各样本任务独立发现。
+- 参考注释和索引是共同输入，共享参考错误会影响依赖它的样本。
+- 最终表达矩阵和 Excel 等汇总要求全部纳入样本成功，不会静默丢弃失败样本。失败运行不会发布新的完整汇总；旧运行留下的文件不能证明本次成功，应检查退出码与日志。
+- 各作业共享机器的 CPU、内存和磁盘；`--cores` 控制线程调度预算，并不是操作系统级内存或磁盘隔离。
+
+## 读长与矩阵的含义
+
+每个样本的平均单条 read 长度为 `两端总碱基数 / 两端总 read 数`，保留小数；它不是 paired-end 片段长度。启用 fastp 时使用清洗后 clean FASTQ 的实际读长，因此接头或 polyG 修剪产生的读长变化会进入 prepDE 计数换算。记录位于 `alignment/read_lengths/{sample}.json`，汇总为 `alignment/read_lengths.json`，例如：
+
+```json
+{"sampleA": 149.35, "sampleB": 74.8}
 ```
 
-每样本 JSON 记录状态、原始比例、实际/目标采样量、方向、警告和失败原因；日志目录保留命令、版本、RSeQC stdout/stderr。质量检查的 TSV 作为日志保存，失败后仍保留；只有通过才生成 `strandness.env`，StringTie 显式依赖该文件。单样本判链步骤输出诊断记录，即使判链失败也先收集其它样本的结果，最终由质量检查规则阻断定量。
-
-链特异性步骤使用独立的 `workflow/envs/strandness.yaml`（RSeQC 5.0.4、pysam、gffread）；普通模式只需要原来的 `rnaseq.yaml`。继续使用 `--use-conda` 自动管理环境。
-
-修复注释、BAM 或配置后，Snakemake 会按依赖重算。若只修复了运行环境、工具故障，之前的失败 JSON 仍是已完成的诊断文件，需要在原命令中添加 `--forcerun infer_strandness strandness_gate` 重新判链。若旧 BAM 曾以错误或未知的链参数比对，应先核实来源，再按需要显式重跑比对；本升级不会自动重跑用户现有样本。
-
-示例（先检查再正式运行）：
+pipeline 的 prepDE 调用示例（默认普通模式、在运行目录执行）：
 
 ```bash
+python /home/weiyuekuan/12.Snakemake/RNA-seq-pipeline/workflow/scripts/prepDE.py \
+  -i quantification/sample_lst.txt --read-lengths alignment/read_lengths.json --gene-id-only \
+  --reference quantification/reference/reference.gtf --ballgown \
+  -g quantification/gene_count_matrix.raw.csv -t quantification/transcript_count_matrix.csv
+```
+
+每转录本计数公式仍是 `ceil(coverage × exon_length / sample_mean_read_length)`，再合并至基因。这是 StringTie 覆盖度推算的 read counts，不是直接计数 fragments。每个样本均与规范参考完整模型比对；非有限或负覆盖度会报错。StringTie 2.2.3 可能省略零估计的冗余转录本：默认 `use_ballgown: true` 时，仅在同次运行 `t_data.ctab` 的 ID、基因、坐标、链、外显子数和长度全部匹配，且缺失模型的 coverage/FPKM 明确为零时恢复零估计模型，并记录名单。已有 GTF 的 coverage 也必须与表一致。非零缺失、错误表或缺少证据均阻断；`use_ballgown: false` 遇到此类缺失时会提示启用 Ballgown 或检查参考。这里的零是 StringTie 的估计分配，不证明转录本生物学上不存在。
+
+独立调用 bundled prepDE 时保留原 `-l` 默认75和 gene symbol 拼接行为，新增 `--read-lengths`、`--gene-id-only` 才启用本流程行为。支持含空格的 GTF 路径；不应把修复前的 `gene_id|gene_name` raw 表直接交给新的严格汇总器，应重跑 prepDE。
+
+FPKM/TPM 来自 StringTie `-A`。正常非零样本 TPM 总和检查约为100万；全零样本必须 count/FPKM/TPM 一致为零。缺少记录、错误 ID 映射或无法解释的额外模型都不会自动补零。未表达但有合法模型的基因由 StringTie 明确输出零值。
+
+## 线程和磁盘
+
+`threads.hisat2` 是 HISAT2 总线程；`samtools_view`、`samtools_sort` 按 samtools `-@` 表示附加线程，调度预算另计这两个进程的主线程。`samtools_index`、`stringtie` 为总线程。
+
+比对流程根据 Snakemake 实际分配的 `{threads}` 限制各工具。当获得至少3个线程时使用流水线；只有1或2个线程时顺序执行 HISAT2、view、sort，暂存 SAM/BAM，避免三个进程同时超出预算。低线程模式需要更多临时磁盘。临时文件放在样本 alignment 目录下，步骤退出后清理；只有成功时发布最终 BAM/summary。日志中记录实际资源分配和原始输入路径。
+
+## 环境与运行
+
+Snakemake 使用单独环境；通过 `--use-conda` 管理业务环境：
+
+- `workflow/envs/rnaseq.yaml`：HISAT2 2.2.1、samtools 1.20、StringTie 2.2.3、Python 和表格依赖。
+- `workflow/envs/strandness.yaml`：Python、pysam、gffread、RSeQC 5.0.4。**普通模式也使用此环境完成共用注释/BAM检查**，但不会运行 RSeQC 判链。
+- `workflow/envs/fastp.yaml`：Python 3.11.9、fastp 1.3.6；仅在 `fastp.enabled: true` 时使用。
+
+以下是 Linux/bash 示例。先把 `RNASEQ_WORKDIR` 改为自己的运行目录，并按所选模式准备其中的 cleandata 或 rawdata；不要把源码目录作为运行目录。要使用 rawdata 清洗，先在配置文件中设置 `fastp.enabled: true`，同时设置 `fastp.trim_poly_g`。
+
+```bash
+RNASEQ_SOURCE=/home/weiyuekuan/12.Snakemake/RNA-seq-pipeline
+RNASEQ_WORKDIR=/path/to/rnaseq-workdir
+
 snakemake \
-  --snakefile /home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/workflow/Snakefile \
-  --configfile /home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/config/config.yaml \
-  --directory /home/pipeline/2.Snakemake-workdir/1.RNA-seq-workdir \
-  --use-conda --cores 32 --dry-run --printshellcmds \
+  --snakefile "$RNASEQ_SOURCE/workflow/Snakefile" \
+  --configfile "$RNASEQ_SOURCE/config/config.yaml" \
+  --directory "$RNASEQ_WORKDIR" \
+  --use-conda --cores 32 --keep-going --dry-run --printshellcmds \
   --config stranded=true
 ```
 
-检查通过后去掉 `--dry-run` 执行。源码测试使用 `python -m unittest discover -s tests -v`；真实工具集成测试的环境配置见 `tests/test_workflow_integration.py`，本次验证范围与结果见 [tests/VALIDATION.md](tests/VALIDATION.md)。
+检查样本、参考、运行分支和重跑范围后，去掉 `--dry-run` 正式执行。普通模式改为 `--config stranded=false`。中断后可加 `--rerun-incomplete`；运行目录迁移或已有结果升级时先检查 dry-run，不使用 `--touch` 将未核实的旧文件标记为新结果。
 
-## 1. 项目简介
-这是一个基于 Snakemake 的 RNA-seq 表达定量流程，工具固定为：
-- HISAT2
-- Samtools
-- StringTie
-- Python
-流程固定为：
-1. 自动扫描 `cleandata/`
-2. HISAT2 比对
-3. `samtools view` 转 BAM，并支持可调 `mapq_filter`
-4. `samtools sort`
-5. `samtools index`
-6. 按 `stranded` 开关选择普通定量或 RSeQC 判链后定量；StringTie 保持 `-e -A`，`-B` 可开关
-7. 汇总比对 summary，生成 `alignment_report.csv`
-8. `prepDE.py` 生成 raw count matrix
-9. 汇总生成：
-   - `gene_count_matrix.csv`
-   - `gene_fpkm_matrix.csv`
-   - `gene_tpm_matrix.csv`
-10. 导出 `gene_expression_matrices.xlsx`
----
-## 环境管理模式
-
-本流程采用 **两层环境**，避免把 Snakemake 与 RNA-seq 业务软件混在同一 conda 环境中。
-
-1. **Snakemake 专用环境**（本机示例名 `Snakemake`，亦可自建如 `snakemake_env`）：仅用于安装、激活后运行 Snakemake（负责解析 `Snakefile`、调度 rule、拉取 conda 环境）。**不要**在该环境中手动安装 HISAT2、Samtools、StringTie、pandas、openpyxl；这些由 workflow 环境提供即可。
-2. **RNA-seq workflow Conda 环境**：由 `envs/rnaseq.yaml` 定义。使用 `snakemake --use-conda` 时，Snakemake 会根据该文件 **自动创建或复用** 独立环境，并在已声明 `conda:` 的 rule 内激活后执行命令。
-
-**第一次运行**可能较慢，因为 Snakemake 需要先创建 `envs/rnaseq.yaml` 对应的 conda 环境；之后同一机器上通常会直接复用缓存环境。
-
-**后续其他 pipeline**：建议各自维护独立的 `envs/*.yaml`，同样通过 `--use-conda` 调用，保持调度环境与业务依赖分离。
-
----
-## 目录布局
-
-本仓库将 **pipeline 源码** 与 **运行数据/结果** 彻底分离。
-
-**Pipeline 源码目录**（仅包含 `Snakefile`、脚本、conda 环境定义与配置文件；不要在此目录下存放 `cleandata`、`alignment`、`quantification`、`.snakemake` 等运行产物）：
-
-`/home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/`
-
-推荐布局：
-
-```
-/home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/
-├── workflow/
-│   ├── Snakefile
-│   ├── scripts/
-│   │   ├── build_alignment_report.py
-│   │   ├── build_expression_matrices.py
-│   │   ├── export_expression_xlsx.py
-│   │   ├── prepare_strand_bed.py
-│   │   ├── strandness.py
-│   │   └── prepDE.py
-│   └── envs/
-│       ├── rnaseq.yaml
-│       └── strandness.yaml
-├── config/
-│   └── config.yaml
-├── tests/
-└── README.md
-```
-
-**Workdir 运行目录**（所有输入、输出、日志与 Snakemake 元数据；使用 `--directory` 指向此处）：
-
-`/home/pipeline/2.Snakemake-workdir/1.RNA-seq-workdir/`
-
-```
-/home/pipeline/2.Snakemake-workdir/1.RNA-seq-workdir/
-├── cleandata/
-├── alignment/
-├── quantification/
-├── logs/
-└── .snakemake/          # 首次运行后由 Snakemake 自动生成，无需手工创建
-```
-
-运行 Snakemake 时 **必须** 指定 `--snakefile` 与 `--directory`（workdir），以便相对路径 `cleandata`、`alignment`、`quantification` 等均解析到 workdir 下，而非源码目录。默认配置文件为源码目录下的 `config/config.yaml`（由 `Snakefile` 固定加载）；若使用副本或自定义路径，可再加 `--configfile /path/to/config.yaml` 覆盖。
-
-本流程面向 Linux/bash 环境运行；Windows 用户请通过 WSL、Linux 服务器或集群环境执行。
-
----
-## 2. 输入数据组织方式
-以下路径均相对于 **workdir**（`--directory` 所设目录）。输入目录结构固定如下：
-```bash
-cleandata/{sample}/{sample}_1.fastq.gz
-cleandata/{sample}/{sample}_2.fastq.gz
-例如（本账号 workdir 内已有数据）：
-cleandata/R_MBS1/R_MBS1_1.fastq.gz
-cleandata/R_MBS1/R_MBS1_2.fastq.gz
-cleandata/R_MBS2/R_MBS2_1.fastq.gz
-cleandata/R_MBS2/R_MBS2_2.fastq.gz
-若为其他命名，请在 config.yaml 的 sample_scan.r1_suffix / r2_suffix 中修改（如 _1.clean.fastq.gz）。
-说明：
-只扫描 cleandata/ 下一级子目录
-子目录名就是 sample 名
-样本名使用字母、数字、下划线、点或连字符，首字符为字母、数字或下划线
-必须同时存在一对非空 FASTQ 文件才识别为有效样本
-普通文件如 nohup.out 会被忽略
-strict=true 时若发现不完整样本目录，流程会直接报错
-strict=false 时会 warning 并跳过
-```
-
-## 3. 与目录布局的关系
-- 源码与配置位于 **pipeline 源码目录**（见上文「目录布局」）。
-- `cleandata/`、`alignment/`、`quantification/`、`logs/`、`.snakemake/` 仅存在于 **workdir**，不会出现在源码目录中。
-
-## 4. config.yaml 参数说明
-paths
-clean_dir：输入 clean FASTQ 根目录
-align_dir：比对结果输出目录
-quant_dir：定量结果输出目录
-logs_dir：运行日志输出目录，默认 logs
-reference
-hisat2_index_prefix：HISAT2 索引前缀
-annotation：参考注释文件，可为 GTF 或 GFF
-sample_scan
-r1_suffix：R1 文件后缀（相对子目录名 sample），本账号默认 _1.fastq.gz
-r2_suffix：R2 文件后缀，本账号默认 _2.fastq.gz
-strict：扫描是否严格检查不完整样本目录
-alignment
-mapq_filter：samtools view 的 MAPQ 过滤阈值，默认 30（普通和链特异性分支均生效）；设为 0 可关闭过滤
-hisat2_extra：传递给 HISAT2 的额外参数
-stringtie
-use_ballgown：是否加 -B
-extra：传递给 StringTie 的额外参数
-threads
-hisat2
-samtools_view
-samtools_sort
-samtools_index
-stringtie
-output
-xlsx：最终 Excel 输出路径
-
-## 5. 准备 HISAT2 index
-先准备参考基因组 FASTA，然后建立索引，例如：
-hisat2-build reference.fa reference.fa
-之后在 config.yaml 中填写：
-reference:
-  hisat2_index_prefix: "/your/path/reference.fa"
-注意：这里填写的是 索引前缀，不是随便一个目录说明文字。
-
-本账号 `pipeline` 已在 `/home/pipeline/3.Ct_ZJ_genome/hisat2_index/` 下建好 HISAT2 索引，前缀为 `Ct_ZJ_T2T_index`（完整路径见 `config/config.yaml`）。
-
-`workflow/envs/rnaseq.yaml` 中的 **HISAT2 版本应与建索引时所用版本一致**（当前约定为 **2.2.2**），否则运行时可能提示索引与程序版本不匹配。
-
-## 6. 准备注释文件
-将 GTF 或 GFF/GFF3 注释文件放到服务器某个路径，然后在 config.yaml 中填写：
-reference:
-  annotation: "/your/path/reference_annotation.gtf"
-本账号（`pipeline`）默认参考与注释位于目录 `/home/pipeline/3.Ct_ZJ_genome/`（HISAT2 索引在 `hisat2_index/`，基因为 `Ct_ZJ_T2T_gene.gff3`），已在 `config/config.yaml` 中配置。
-
-## 7. prepDE.py
-Python3 兼容版 `prepDE.py` 已内置在源码目录 `workflow/scripts/prepDE.py`，无需再手动放到 workdir 或 `quantification/` 目录。
-
-## 8. 准备 Snakemake 专用环境
-请单独创建一个只用于运行 Snakemake 的 conda 环境，例如：
-```bash
-conda create -n Snakemake -c conda-forge -c bioconda snakemake
-```
-（名称可自定；本账号使用环境名 **`Snakemake`**。）
-激活后 **无需** 再向该环境安装 HISAT2、Samtools、Stringtie、pandas、openpyxl；这些由 `envs/rnaseq.yaml` 在 `--use-conda` 时自动管理。
-
-### `conda info --envs` 里出现一长串路径？
-执行 `conda info --envs` 时，可能会多出一行 **无环境名**、路径形如  
-`.../workdir/.snakemake/conda/<哈希>_`。那是 Snakemake 为 `rnaseq.yaml` 创建的 **workflow 业务环境**（HISAT2 / samtools / stringtie 等），由 Snakemake 在跑相应 rule 时自动激活；**不需要**也不建议手动 `conda activate` 到该路径。日常只需激活上方的 **Snakemake**（调度）环境即可。
-
-## 9. 如何运行（两层环境 + `--use-conda` + 源码/workdir 分离）
-在已激活 Snakemake 专用环境的前提下，**从任意目录**执行下列命令均可；须指定 `--snakefile` 与 `--directory`；默认使用源码目录中的 `config/config.yaml`（若需其它配置文件，可加 `--configfile`）。
-
-**提醒**：
-
-- 务必先 `conda activate Snakemake`（或你本机为 Snakemake 单独创建的其它环境名）。
-- 首次运行会在 **workdir** 下生成 `.snakemake/`，并可能耗时创建 `rnaseq` conda 环境缓存。
-- `cleandata`、比对与定量结果、Excel 等均在 workdir 下，**不会**写入源码目录。
-
-1. dry-run（检查规则和依赖，不执行分析；环境安装使用下一步命令）：
+首次缺少环境时会安装依赖，后续复用缓存。本工作区要求下载/安装先使用临时取消代理的直接连接，连接失败才使用 `http://127.0.0.1:17897`，不修改永久代理环境。可先单独准备环境：
 
 ```bash
-snakemake \
-  --snakefile /home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/workflow/Snakefile \
-  --directory /home/pipeline/2.Snakemake-workdir/1.RNA-seq-workdir \
-  --use-conda \
-  -n
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY \
+  -u http_proxy -u https_proxy -u all_proxy \
+  snakemake --snakefile "$RNASEQ_SOURCE/workflow/Snakefile" \
+  --configfile "$RNASEQ_SOURCE/config/config.yaml" \
+  --directory "$RNASEQ_WORKDIR" --use-conda --cores 2 --conda-create-envs-only
 ```
 
-2. 只创建 conda 环境并下载依赖（可选，适合第一次运行前先准备环境）：
+如果上述命令因网络连接失败，再用该命令级代理重试：
 
 ```bash
-snakemake \
-  --snakefile /home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/workflow/Snakefile \
-  --directory /home/pipeline/2.Snakemake-workdir/1.RNA-seq-workdir \
-  --use-conda \
-  --conda-create-envs-only \
-  --cores 32
+env -u ALL_PROXY -u all_proxy -u http_proxy -u https_proxy \
+  HTTP_PROXY=http://127.0.0.1:17897 HTTPS_PROXY=http://127.0.0.1:17897 \
+  snakemake --snakefile "$RNASEQ_SOURCE/workflow/Snakefile" \
+  --configfile "$RNASEQ_SOURCE/config/config.yaml" \
+  --directory "$RNASEQ_WORKDIR" --use-conda --cores 2 --conda-create-envs-only
 ```
 
-3. 正式运行：
+索引文件、FASTQ、注释、脚本和相关参数变化按依赖触发重算。若只修复判链工具环境而之前已生成 FAIL JSON，需强制重新判链：对单个样本可在运行命令中加 `--forcerun "$RNASEQ_WORKDIR/quantification/stranded/strandness/sampleA.json"`（替换样本名和自定义 quant_dir）；对全部样本可加 `--forcerun infer_strandness strandness_gate`。修复前的结果如缺少完整 provenance，不能仅凭文件存在认定可复用。
 
-```bash
-snakemake \
-  --snakefile /home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/workflow/Snakefile \
-  --directory /home/pipeline/2.Snakemake-workdir/1.RNA-seq-workdir \
-  --use-conda \
-  --cores 32 -p
-```
+## 输出
 
-4. 若中断后重跑：
+普通模式的定量根目录为 `paths.quant_dir`；链特异模式在其下加 `stranded/`。Excel 同样在配置输出目录下加 stranded 子目录。
 
-```bash
-snakemake \
-  --snakefile /home/pipeline/1.Snakemake-pipeline/1.RNA-seq-pipeline/workflow/Snakefile \
-  --directory /home/pipeline/2.Snakemake-workdir/1.RNA-seq-workdir \
-  --use-conda \
-  --cores 32 --rerun-incomplete -p
-```
+```text
+cleandata/{sample}/{sample}_1.clean.fastq.gz  # 启用 fastp 时生成
+cleandata/{sample}/{sample}_2.clean.fastq.gz
+qc/fastp/{sample}/{sample}.fastp.html
+qc/fastp/{sample}/{sample}.fastp.json
+logs/{sample}/fastp.log
 
-**说明**：务必加上 `--use-conda`，否则 Snakemake 不会按 `workflow/envs/rnaseq.yaml` 为各 rule 准备业务软件环境。
-
-运行过程中，Snakemake 自身调度日志会保存在 `.snakemake/log/`；各步骤的详细日志会保存在 `logs/`：
-
-```bash
-logs/{sample}/hisat2_align_sort.log
-logs/{sample}/samtools_index.log
-logs/{sample}/stringtie_quant.log
-logs/build_sample_list.log
-logs/build_alignment_report.log
-logs/prepde_raw_counts.log
-logs/finalize_expression_matrices.log
-logs/export_expression_xlsx.log
-```
-
-## 10. mapq_filter=30 和 mapq_filter=0 的区别
-当前默认 `mapq_filter: 30`，即在生成 BAM 时保留 MAPQ >= 30 的比对记录。
-mapq_filter = 30
-实际执行：
-samtools view -b -q 30
-含义：
-只保留 MAPQ >= 30 的比对结果
-更严格
-可能会降低部分基因的计数
-对多重比对 reads 更保守
-mapq_filter = 0
-实际执行：
-samtools view -b
-含义：
-不做 MAPQ 过滤
-更接近普通 RNA-seq 默认流程
-保留更多 reads
-
-## 11. 最终输出文件说明
-alignment
-alignment/{sample}/{sample}.sorted.bam
-alignment/{sample}/{sample}.sorted.bam.bai
+alignment/{sample}/{sample}.sorted.bam[.bai]
 alignment/{sample}/{sample}.align_summary.txt
 alignment/alignment_report.csv
-logs
-logs/{sample}/hisat2_align_sort.log
-logs/{sample}/samtools_index.log
-logs/{sample}/stringtie_quant.log
-logs/build_alignment_report.log
-logs/prepde_raw_counts.log
-logs/finalize_expression_matrices.log
-logs/export_expression_xlsx.log
-quantification
-quantification/{sample}/{sample}.gtf
-quantification/{sample}/{sample}_abundance.tab
-quantification/sample_lst.txt
-quantification/gene_count_matrix.raw.csv
-quantification/transcript_count_matrix.csv
-quantification/gene_count_matrix.csv
-quantification/gene_fpkm_matrix.csv
-quantification/gene_tpm_matrix.csv
-quantification/gene_expression_matrices.xlsx
+alignment/read_lengths/{sample}.json
+alignment/read_lengths.json
 
-## 12. Excel sheet 说明
-最终 Excel 文件 quantification/gene_expression_matrices.xlsx 包含以下 sheet：
-alignment_report
-gene_count
-gene_fpkm
-gene_tpm
+quantification/[stranded/]reference/reference.gtf
+quantification/[stranded/]reference/reference.bed12
+quantification/[stranded/]reference/bam_validation/{sample}.json
+quantification/[stranded/]{sample}/{sample}.gtf
+quantification/[stranded/]{sample}/{sample}_abundance.tab
+quantification/[stranded/]{sample}/*.ctab        # use_ballgown=true
+quantification/[stranded/]sample_lst.txt
+quantification/[stranded/]gene_count_matrix.raw.csv
+quantification/[stranded/]transcript_count_matrix.csv
+quantification/[stranded/]gene_count_matrix.csv
+quantification/[stranded/]gene_fpkm_matrix.csv
+quantification/[stranded/]gene_tpm_matrix.csv
+quantification/[stranded/]gene_expression_matrices.xlsx
+quantification/stranded/strandness/{sample}.json
+quantification/stranded/strandness/{sample}.env
+logs/stranded/strandness/{sample}/strandness_diagnostic.tsv
+logs/stranded/strandness/strandness_diagnostic.tsv  # 汇总，不是放行依赖
+```
+
+Excel 有 `alignment_report`、`gene_count`、`gene_fpkm`、`gene_tpm` 四个 sheet。它们的样本和基因顺序经过核对，ID 为文本、表达值为数值。日志在配置的 logs 目录；判链失败的诊断 TSV 和原始 RSeQC 输出仍保留。建立 DAG 前会检查所有声明的输出/日志与原始 FASTQ、参考、附加输入及脚本是否存在同路径或链接冲突，避免任务清理/日志打开时覆盖输入。Excel 导出要求整数回读精确一致，超过工作表行列上限时明确失败，CSV仍保留。
+
+## 测试
+
+```bash
+cd /home/weiyuekuan/12.Snakemake/RNA-seq-pipeline
+python -m unittest discover -s tests -v
+```
+
+缺少真实工具时部分测试会 skip；测试结果不能把 skip 当成通过。完整 FASTQ 集成显式设置 `RNASEQ_TEST_FULL_FASTQ=1`，可通过 `RNASEQ_TEST_SNAKEMAKE/HISAT2/HISAT2_BUILD/SAMTOOLS/STRINGTIE/RSEQC/GFFREAD` 指定已有工具；`RNASEQ_TEST_WORKFLOW_PYTHON` 指向包含 openpyxl 的 Python，运行测试的 Python 需含 pysam。fastp 实测使用 `RNASEQ_TEST_FASTP` 指定已有可执行文件，否则从 PATH 查找；raw FASTQ 经 fastp 到 Excel 的完整集成也需要上述完整 FASTQ 开关和工具。设置 `RNASEQ_TEST_KEEP=1` 保留人工输入与所有日志。
+
+这些测试不下载依赖，不修改真实样本；包括 polyG 开关与实际保留读长、低质量/N/短 read 过滤、raw 配对错误阻断、raw 到 Excel、FR/RF与失败门控、含gene_name/竖线ID、每样本不同读长、Excel ID、GFF边界、路径引号、线程上限、Ballgown恢复和默认依赖重跑。
+
+2026-10-23 fastp 接入的具体实测结果和日志见 [tests/FASTP_VALIDATION.md](tests/FASTP_VALIDATION.md)。

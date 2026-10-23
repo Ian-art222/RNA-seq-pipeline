@@ -1,4 +1,4 @@
-# false: original unstranded quantification; true: RSeQC-gated stranded quantification.
+# false: unstranded; true: each sample passes its own RSeQC gate and uses its own strand.
 # Command-line override: --config stranded=true
 stranded: false
 strandness:
@@ -8,32 +8,50 @@ strandness:
   min_dominance: 0.80
   # Optional BED12 from the SAME annotation. Empty: generate from reference.annotation.
   bed12: ""
+# false: use existing clean FASTQ; true: run fastp on raw FASTQ first.
+fastp:
+  enabled: false
+  # Explicit switch: true => --trim_poly_g; false => --disable_trim_poly_g.
+  trim_poly_g: false
+  qualified_quality_phred: 20
+  unqualified_percent_limit: 30
+  n_base_limit: 5
+  length_required: 40
 paths:
+  raw_dir: "rawdata"
+  qc_dir: "qc/fastp"
   clean_dir: "cleandata"
   align_dir: "alignment"
   quant_dir: "quantification"
   logs_dir: "logs"
 reference:
-  # HISAT2 索引前缀（不含 .*.ht2 后缀）；见 /home/pipeline/3.Ct_ZJ_genome/hisat2_index/
-  hisat2_index_prefix: "/home/pipeline/3.Ct_ZJ_genome/hisat2_index/Ct_ZJ_T2T_index"
-  # StringTie / 矩阵整理用注释；本机为 GFF3
-  annotation: "/home/pipeline/3.Ct_ZJ_genome/Ct_ZJ_T2T_gene.gff3"
-sample_scan:
-  # workdir/cleandata 下实际为 {sample}_1.fastq.gz / {sample}_2.fastq.gz
+  hisat2_index_prefix: "/home/weiyuekuan/3.hista2_reference/CtZJ_T2T_index"
+  annotation: "/home/weiyuekuan/3.hista2_reference/CtZJ_T2T_gene.gtf"
+# When fastp.enabled=true, scan raw_dir/{sample}/{sample}{suffix}.
+raw_sample_scan:
   r1_suffix: "_1.fastq.gz"
   r2_suffix: "_2.fastq.gz"
   strict: true
+# Existing clean input names, also used for fastp output names.
+sample_scan:
+  r1_suffix: "_1.clean.fastq.gz"
+  r2_suffix: "_2.clean.fastq.gz"
+  strict: true
 alignment:
-  mapq_filter: 30
+  # 0 disables the alignment-stage MAPQ filter; RSeQC has its own threshold above.
+  mapq_filter: 0
   hisat2_extra: ""
 stringtie:
   use_ballgown: true
   extra: ""
+# Alignment totals include the main threads of both samtools processes.
+# A --cores limit below 3 uses sequential SAM/BAM stages to respect that budget.
 threads:
+  fastp: 8
   hisat2: 16
-  samtools_view: 8
-  samtools_sort: 8
-  samtools_index: 4
+  samtools_view: 8  # additional threads, as in samtools -@
+  samtools_sort: 8  # additional threads, as in samtools -@
+  samtools_index: 4  # total threads; command uses -@ (allocated_threads - 1)
   stringtie: 16
 output:
   xlsx: "quantification/gene_expression_matrices.xlsx"
