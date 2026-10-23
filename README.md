@@ -30,7 +30,7 @@
 
 ## 源码和运行目录
 
-源码目录：`/home/weiyuekuan/12.Snakemake/Pipeline/RNA-seq-pipeline`。源码包含 workflow、config、tests；数据和分析结果放在独立的运行目录，用 `--directory` 指定。
+源码目录：`/home/weiyuekuan/12.Snakemake/Pipeline/RNA-seq-pipeline`。源码包含 workflow、config、tests。默认运行工作目录为 `/home/weiyuekuan/12.Snakemake/Workdir/RNA-seq-workdir`，在 `workflow/profiles/default/config.yaml` 的 `directory` 中设置；数据和分析结果均放在该目录。命令行显式传入 `--directory` 可覆盖默认值。
 
 ```text
 workdir/
@@ -209,11 +209,11 @@ Snakemake 使用单独环境；通过 `--use-conda` 管理业务环境：
 - `workflow/envs/strandness.yaml`：Python、pysam、gffread、RSeQC 5.0.4。**普通模式也使用此环境完成共用注释/BAM检查**，但不会运行 RSeQC 判链。
 - `workflow/envs/fastp.yaml`：Python 3.11.9、fastp 1.3.6；仅在 `fastp.enabled: true` 时使用。
 
-以下是 Linux/bash 示例。先把 `RNASEQ_WORKDIR` 改为自己的运行目录，并按所选模式准备其中的 cleandata 或 rawdata；不要把源码目录作为运行目录。要使用 rawdata 清洗，先在配置文件中设置 `fastp.enabled: true`，同时设置 `fastp.trim_poly_g`。
+以下是 Linux/bash 示例，使用已设置的默认工作目录。按所选模式在其中准备 cleandata 或 rawdata；如需其他运行目录，可修改 `RNASEQ_WORKDIR` 或显式传入 `--directory`。要使用 rawdata 清洗，先在配置文件中设置 `fastp.enabled: true`，同时设置 `fastp.trim_poly_g`。
 
 ```bash
 RNASEQ_SOURCE=/home/weiyuekuan/12.Snakemake/Pipeline/RNA-seq-pipeline
-RNASEQ_WORKDIR=/path/to/rnaseq-workdir
+RNASEQ_WORKDIR=/home/weiyuekuan/12.Snakemake/Workdir/RNA-seq-workdir
 
 snakemake \
   --snakefile "$RNASEQ_SOURCE/workflow/Snakefile" \

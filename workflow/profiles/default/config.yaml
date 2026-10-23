@@ -1,3 +1,5 @@
 # Keep processing independent samples after a job fails. The overall workflow
 # still exits unsuccessfully; incomplete cohorts never produce new matrices.
 keep-going: true
+# Default analysis directory; an explicit --directory overrides this setting.
+directory: "/home/weiyuekuan/12.Snakemake/Workdir/RNA-seq-workdir"
