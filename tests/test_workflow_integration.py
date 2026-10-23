@@ -97,6 +97,22 @@ class WorkflowIntegrationTests(unittest.TestCase):
                     feature, start + 1, start + 900, strand, attributes
                 ))
         annotation.write_text("".join(rows))
+        # These fixtures import BAMs instead of aligning the placeholder FASTQ.
+        # Publish the prerequisite reference before the BAMs, just as the real
+        # FASTQ pipeline does. A missing prerequisite schedules upstream work
+        # even when it is declared ancient for timestamp-based reruns.
+        quant = workdir / "quantification"
+        logs = workdir / "logs"
+        if stranded:
+            quant /= "stranded"
+            logs /= "stranded"
+        status, output = self.run_command([
+            str(Path(sys.executable)), str(ROOT / "workflow/scripts/prepare_strand_bed.py"),
+            "--annotation", str(annotation),
+            "--output", str(quant / "reference/reference.bed12"),
+            "--normalized-gtf", str(quant / "reference/reference.gtf"),
+            "--report", str(logs / "reference/prepare_bed.json")], cwd=workdir)
+        self.assertEqual(status, 0, output)
         for i in range(1, 9):
             index_file = workdir / f"unused_index.{i}.ht2"
             index_file.write_text("fixture only: these tests start from BAM\n")

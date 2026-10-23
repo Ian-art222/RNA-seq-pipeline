@@ -36,7 +36,7 @@ class StrandBedTests(unittest.TestCase):
 
     def test_plus_minus_multiexon_coordinates(self):
         text = gtf("exon", 101, 150) + gtf("exon", 201, 250)
-        text += gtf("exon", 401, 450, "tx2", "-") + gtf("exon", 301, 350, "tx2", "-")
+        text += gtf("exon", 401, 450, "tx2", "-", gene="g2") + gtf("exon", 301, 350, "tx2", "-", gene="g2")
         code, report = self.run_prepare(text)
         self.assertEqual(code, 0)
         records = bed.read_bed12(self.output)
@@ -314,7 +314,9 @@ class StrandBedTests(unittest.TestCase):
         source = gtf("exon", 1, 20, tid="tx%3B1|isoform", gene="g1|original")
         code, report = self.run_prepare(source, "--normalized-gtf", str(normalized))
         self.assertEqual(code, 0, report)
-        self.assertEqual(normalized.read_bytes(), self.annotation.read_bytes())
+        self.assertEqual(self.annotation.read_text(), source)
+        self.assertEqual(bed.read_gtf_models(normalized)[0], bed.read_gtf_models(self.annotation)[0])
+        self.assertIn('\ttranscript\t', normalized.read_text())
         self.assertEqual(bed.read_bed12(self.output)[0]["name"], "tx%3B1|isoform")
         self.assertEqual(report["normalized_annotation"], str(normalized))
 

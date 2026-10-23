@@ -1,10 +1,12 @@
 # RNA-seq Snakemake pipeline
 
-2026-10-23 恢复版：在 GitHub 原版基础上恢复本次对话中的全部修复、fastp 清洗及样本独立执行改进，源码移至 `/home/weiyuekuan/12.Snakemake/RNA-seq-pipeline`。比对 BAM 的默认 `alignment.mapq_filter` 改为 `0`，RSeQC 判链的独立阈值 `strandness.mapq` 仍为 `30`。本次恢复与复验记录见 [tests/RESTORED_VALIDATION_20261023.md](tests/RESTORED_VALIDATION_20261023.md)。
+2026-10-23 恢复版：在 GitHub 原版基础上恢复本次对话中的全部修复、fastp 清洗及样本独立执行改进，源码移至 `/home/weiyuekuan/12.Snakemake/Pipeline/RNA-seq-pipeline`。比对 BAM 的默认 `alignment.mapq_filter` 改为 `0`，RSeQC 判链的独立阈值 `strandness.mapq` 仍为 `30`。本次恢复与复验记录见 [tests/RESTORED_VALIDATION_20261023.md](tests/RESTORED_VALIDATION_20261023.md)。
 
-本轮完整回归 164 项全部通过，0 失败、0 错误、0 跳过；使用人工 FASTQ/BAM 和现有软件环境验证，真实参考另做只读兼容检查。
+最新完整回归 **177 项全部通过，0 失败、0 错误、0 跳过**；完整 CtZJ 注释另用人工 BAM 验证至最终 Excel。
 
-双端 raw FASTQ → 可选 fastp 清洗 → clean FASTQ → HISAT2 → 排序/索引 BAM → 参考兼容检查 → StringTie `-G -e` → read count 估计、FPKM、TPM 和 Excel。默认从已有 clean FASTQ 开始；可在配置中启用 fastp 并明确指定是否修剪 polyG。输入必须属于同一个参考基因组；不进行新转录本发现或差异表达统计。
+此前 164 项回归通过，但遗漏了带 CDS/UTR、exon-only GTF 从前置处理到 prepDE 的完整链路。默认 CtZJ 参考也会触发此缺陷。本次修复与补充验证见 [tests/GTF_REFERENCE_FIX_20261023.md](tests/GTF_REFERENCE_FIX_20261023.md)，旧报告保留为历史记录，不能据此认定所有参考都能完成定量。
+
+参考模型预检通过后：双端 raw FASTQ → 可选 fastp 清洗 → clean FASTQ → HISAT2 → 排序/索引 BAM → 参考兼容检查 → StringTie `-G -e` → read count 估计、FPKM、TPM 和 Excel。默认从已有 clean FASTQ 开始；可在配置中启用 fastp 并明确指定是否修剪 polyG。输入必须属于同一个参考基因组；不进行新转录本发现或差异表达统计。
 
 2026-10-23 样本独立执行更新：已将判链改为逐样本放行，默认继续执行其他无失败依赖的任务；故障隔离、修复续跑及结果复用的验证见 [tests/SAMPLE_ISOLATION_20261023.md](tests/SAMPLE_ISOLATION_20261023.md)。
 
@@ -28,7 +30,7 @@
 
 ## 源码和运行目录
 
-源码目录：`/home/weiyuekuan/12.Snakemake/RNA-seq-pipeline`。源码包含 workflow、config、tests；数据和分析结果放在独立的运行目录，用 `--directory` 指定。
+源码目录：`/home/weiyuekuan/12.Snakemake/Pipeline/RNA-seq-pipeline`。源码包含 workflow、config、tests；数据和分析结果放在独立的运行目录，用 `--directory` 指定。
 
 ```text
 workdir/
@@ -115,9 +117,21 @@ polyG 设置在本次运行的所有样本间统一。如果样本来自不同�
 
 索引必须是该参考的完整、非空 8 个 `.ht2` 或 8 个 `.ht2l` 文件，不能把前缀写成目录，也不能混放两种格式。不存在、不完整或混合索引在建立 DAG 时立即报错。参考注释必须存在且非空；GTF 需要显式 exon 模型，GFF3 会经 gffread 转换后检查。有 gene 声明时，其染色体、链和范围必须与子模型一致；不能无损表示为单一 gene_id 的 GFF3 多 gene Parent 会在转换前被拒绝，避免静默丢失基因。注释与索引必须来自同一组装；序列名/长度/坐标通过只能说明结构兼容，不能单独证明组装来源一致。
 
+参考预检现在是 fastp、clean 读长统计和 HISAT2 的前置依赖。参考 GTF 支持 `transcript + exon`、包含 CDS/UTR/start_codon/stop_codon 的完整模型，以及有合法 `gene_id`/`transcript_id` 的 exon-only 模型；没有 exon 的 GTF 仍会明确拒绝。参考解析和 StringTie 定量输出解析分开，后者仍严格要求覆盖度、命令记录和完整模型。
+
+标准化 GTF 由与 BED12、prepDE 共用的 exon 模型生成，保留 gene_id/transcript_id/可用 gene_name，原注释不改动。参考 CDS/UTR/codon 会先校验其位于原 exon 内，之后不复制到定量参考副本。重复、重叠及相邻 exon 合并；1–4 bp 的 exon 间隙按固定 StringTie 2.2.3 的实际加载行为合并，5 bp 及以上保留。每一处短内含子及新增 exon 碱基数写入 `prepare_bed.json` 的 `short_intron_merges` / `short_intron_added_exonic_bases`，同时输出警告。当前 CtZJ 为 5 处、共 20 bp；这表示工具采用的模型，不代表对原生物学注释作出修订。依据见 [StringTie 2.2.3 加载参数](https://github.com/gpertea/stringtie/blob/v2.2.3/stringtie.cpp#L353-L357) 与 [短内含子合并源码](https://github.com/gpertea/stringtie/blob/v2.2.3/gclib/gff.cpp#L2162-L2163)。StringTie 无法完整保留的引号/分号等 ID 或 gene_name 字符会前置报错。
+
 `alignment.mapq_filter` 默认为 `0`，不按 MAPQ 过滤比对 BAM；需要时可设为正整数，例如 `30` 保留 MAPQ≥30 的记录。该设置会影响多重比对相关的基因表达；HISAT2 summary 是过滤前统计，不代表最终保留 BAM 的有效定量比例。RSeQC 使用独立的 `strandness.mapq`（默认 `30`）选择判链证据，不会据此裁剪用于 StringTie 定量的 BAM。
 
 `hisat2_extra` 和 `stringtie.extra` 只用于未被流程管理的选项。不能覆盖线程、参考、输入、输出、定量模式或链方向；不支持改变 summary 格式以及在 HISAT2 extra 中另行生成未被规则追踪的输出。`--known-splicesite-infile`、`--novel-splicesite-infile` 支持相对/绝对路径和空格，按 workdir 解析并登记依赖。HISAT2 extra 禁止再次裁剪（`-3/-5/--trim3/--trim5`）、跳读/抽样和手动 `--rna-strandness`，使比对输入与统计 clean 读长保持一致。StringTie extra 禁止添加额外 BAM 或切换模式；支持的 `--ptf` 点特征文件会按 workdir 解析并列入依赖，修改后重跑定量。额外参数先按 shell 风格解析，再安全传递，不作为任意 shell 命令执行。
+
+## 当前仍需注意的支持范围
+
+- 默认输入质量编码按 Phred+33 处理，尚无贯通 raw → fastp → clean → HISAT2 的 +64 声明/转换配置；不要把已知 +64 raw FASTQ 直接交给当前 fastp 分支。仅已有 clean +64 数据可通过 `alignment.hisat2_extra: "--phred64"` 显式告知 HISAT2。质量字符范围检查不能判定编码。
+- `stranded` 是全队列布尔值；支持 stranded 队列内逐样本 FR/RF，不支持同一次运行混合 stranded 与 unstranded 建库。
+- 判链尚无最低有效 alignment 数门槛；也没有普通/链特异样本统一的科学 QC PASS/FAIL 状态。结构有效的全零样本可以进入矩阵，不能把程序成功解释成样本质量达标。
+- 失败重跑可保留历史矩阵；当前没有关联本次运行的成功 manifest。不要只以文件存在判断本次成功。
+- BAM 仍用 BAI，超出其可索引坐标的 alignment 需要 CSI 支持，目前尚未实现。线程已有预算，内存/磁盘/I/O 配额和 Excel 流式导出仍属待改进项。
 
 ## 两种定量模式
 
@@ -169,7 +183,7 @@ strandness:
 pipeline 的 prepDE 调用示例（默认普通模式、在运行目录执行）：
 
 ```bash
-python /home/weiyuekuan/12.Snakemake/RNA-seq-pipeline/workflow/scripts/prepDE.py \
+python /home/weiyuekuan/12.Snakemake/Pipeline/RNA-seq-pipeline/workflow/scripts/prepDE.py \
   -i quantification/sample_lst.txt --read-lengths alignment/read_lengths.json --gene-id-only \
   --reference quantification/reference/reference.gtf --ballgown \
   -g quantification/gene_count_matrix.raw.csv -t quantification/transcript_count_matrix.csv
@@ -198,7 +212,7 @@ Snakemake 使用单独环境；通过 `--use-conda` 管理业务环境：
 以下是 Linux/bash 示例。先把 `RNASEQ_WORKDIR` 改为自己的运行目录，并按所选模式准备其中的 cleandata 或 rawdata；不要把源码目录作为运行目录。要使用 rawdata 清洗，先在配置文件中设置 `fastp.enabled: true`，同时设置 `fastp.trim_poly_g`。
 
 ```bash
-RNASEQ_SOURCE=/home/weiyuekuan/12.Snakemake/RNA-seq-pipeline
+RNASEQ_SOURCE=/home/weiyuekuan/12.Snakemake/Pipeline/RNA-seq-pipeline
 RNASEQ_WORKDIR=/path/to/rnaseq-workdir
 
 snakemake \
@@ -274,7 +288,7 @@ Excel 有 `alignment_report`、`gene_count`、`gene_fpkm`、`gene_tpm` 四个 sh
 ## 测试
 
 ```bash
-cd /home/weiyuekuan/12.Snakemake/RNA-seq-pipeline
+cd /home/weiyuekuan/12.Snakemake/Pipeline/RNA-seq-pipeline
 python -m unittest discover -s tests -v
 ```
 

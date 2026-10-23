@@ -3,7 +3,6 @@
 import argparse
 import json
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,7 +10,8 @@ from pathlib import Path
 
 
 GTF_ATTRIBUTE = re.compile(r'\s*([^\s;]+)\s+(?:"([^"\\]*(?:\\.[^"\\]*)*)"|([^;\s]+))\s*(?:;|$)')
-MODEL_FEATURES = {"exon", "cds", "utr", "five_prime_utr", "three_prime_utr", "transcript", "mrna"}
+MODEL_FEATURES = {"exon", "cds", "utr", "five_prime_utr", "three_prime_utr", "transcript", "mrna",
+                  "start_codon", "stop_codon"}
 
 
 def protect_paths(inputs, outputs):
@@ -89,9 +89,20 @@ def parse_gtf_attributes(text, location):
     return attributes
 
 
+def check_model_attribute(value, label, location):
+    # StringTie's GTF loader cannot preserve quoted/semicolon-containing IDs
+    # or names, including backslash-escaped quotes. Reject before conversion.
+    if value is not None and any(char in '\";' or ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{location}: {label} contains a character StringTie cannot preserve")
+
+
 def read_gtf_models(path):
-    """Read exon models; never infer missing exons from CDS or transcript spans."""
-    models, declared_genes = {}, {}
+    """Read explicit exon models using StringTie 2.2.3's close-exon policy.
+
+    Never infer missing exon models from CDS or transcript spans.
+    """
+    models, declared_genes, gene_names, gene_loci = {}, {}, {}, {}
+    short_introns = []
     input_exons = 0
     for number, fields, start, end in annotation_rows(path):
         feature = fields[2].lower()
@@ -102,6 +113,8 @@ def read_gtf_models(path):
             if not gene:
                 raise ValueError(f"{location}: gene requires a nonempty gene_id")
             declared_genes.setdefault(gene, []).append((fields[0], fields[6], start, end))
+            if attributes.get("gene_name"):
+                gene_names.setdefault(gene, attributes["gene_name"])
         tid = attributes.get("transcript_id")
         if not tid:
             if feature in MODEL_FEATURES or feature.endswith("_utr"):
@@ -109,20 +122,31 @@ def read_gtf_models(path):
             continue
         if not gene or any(char.isspace() for char in tid) or not tid:
             raise ValueError(f"{location}: transcript requires a nonempty gene_id and a whitespace-free transcript_id")
+        check_model_attribute(tid, "transcript_id", location)
+        check_model_attribute(gene, "gene_id", location)
         if fields[6] not in {"+", "-"}:
             raise ValueError(f"{location}: transcript {tid!r} must have strand '+' or '-'")
         identity = (fields[0], fields[6], gene)
+        locus = (fields[0], fields[6])
+        if gene in gene_loci and gene_loci[gene] != locus:
+            raise ValueError(f"{location}: gene_id {gene!r} has inconsistent chromosome or strand across transcripts")
+        gene_loci[gene] = locus
         if tid not in models:
-            models[tid] = {"identity": identity, "exons": [], "spans": [], "subfeatures": []}
+            models[tid] = {"identity": identity, "exons": [], "spans": [], "subfeatures": [],
+                           "gene_name": None, "name_priority": -1}
         model = models[tid]
         if model["identity"] != identity:
             raise ValueError(f"{location}: transcript_id {tid!r} has inconsistent chromosome, strand, or gene_id")
+        symbol = attributes.get("gene_name") or attributes.get("ref_gene_name")
+        priority = 2 if feature in {"transcript", "mrna"} else 1
+        if symbol and priority > model["name_priority"]:
+            model.update(gene_name=symbol, name_priority=priority)
         if feature == "exon":
             model["exons"].append((start, end))
             input_exons += 1
         elif feature in {"transcript", "mrna"}:
             model["spans"].append((start, end))
-        elif feature in {"cds", "utr"} or feature.endswith("_utr"):
+        elif feature in {"cds", "utr", "start_codon", "stop_codon"} or feature.endswith("_utr"):
             model["subfeatures"].append((number, fields[2], start, end))
     if not models:
         raise ValueError(f"{path}: no transcript exon models found; provide a GTF with exon records")
@@ -154,10 +178,64 @@ def read_gtf_models(path):
         for number, feature, left, right in model["subfeatures"]:
             if not any(exon_start <= left and right <= exon_end for exon_start, exon_end in blocks):
                 raise ValueError(f"{path}:{number}: {feature} interval is not contained in exon blocks of transcript {tid!r}")
-        records.append({"chrom": chrom, "start": start, "end": end, "name": tid, "strand": strand, "blocks": blocks})
+        # StringTie 2.2.3 joins exon blocks separated by fewer than five bases.
+        # Apply this same loading behavior to BED12 and prepDE, after validating
+        # metadata against the original blocks. Record every added base.
+        compatible = []
+        for left, right in blocks:
+            gap = left - compatible[-1][1] if compatible else 0
+            if compatible and 0 < gap < 5:
+                short_introns.append({"transcript_id": tid, "chrom": chrom, "strand": strand,
+                                      "start_1based": compatible[-1][1] + 1,
+                                      "end_1based": left, "added_exonic_bases": gap})
+                compatible[-1] = (compatible[-1][0], right)
+            else:
+                compatible.append((left, right))
+        symbol = model["gene_name"] or gene_names.get(gene)
+        check_model_attribute(symbol, "gene_name", f"{path}: transcript {tid!r}")
+        records.append({"chrom": chrom, "start": start, "end": end, "name": tid, "strand": strand,
+                        "blocks": compatible, "gene_id": gene,
+                        "gene_name": symbol})
     records.sort(key=lambda row: (row["chrom"], row["start"], row["end"], row["name"]))
     return records, {"input_exon_records": input_exons,
-                     "merged_exon_blocks": sum(len(row["blocks"]) for row in records)}
+                     "merged_exon_blocks": sum(len(row["blocks"]) for row in records),
+                     "short_intron_merge_policy": "StringTie 2.2.3: merge exon gaps of 1-4 bp",
+                     "short_intron_merges": short_introns,
+                     "short_intron_added_exonic_bases": sum(row["added_exonic_bases"] for row in short_introns)}
+
+
+def write_model_gtf(records, path):
+    """Publish the same explicit exon models used by BED12 and prepDE.
+
+    The source annotation remains untouched. CDS/UTR/codon rows have already
+    been checked; quantification needs only transcript/exon rows. IDs and
+    optional gene names retain the source GTF attribute escaping.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write("# Validated reference exon models for BED12, StringTie and prepDE\n")
+            for row in records:
+                attrs = f'gene_id "{row["gene_id"]}"; transcript_id "{row["name"]}";'
+                if row["gene_name"]:
+                    attrs += f' gene_name "{row["gene_name"]}";'
+                for feature, start, end in [("transcript", row["start"], row["end"])] + [
+                    ("exon", start, end) for start, end in row["blocks"]
+                ]:
+                    handle.write(f'{row["chrom"]}\treference\t{feature}\t{start + 1}\t{end}\t.\t'
+                                 f'{row["strand"]}\t.\t{attrs}\n')
+        # Validate serialization with the shared parser before publishing it.
+        checked, _ = read_gtf_models(temporary)
+        if checked != records:
+            raise ValueError("Normalized GTF changed the validated reference exon models")
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def read_bed12(path):
@@ -376,6 +454,11 @@ def prepare_annotation(annotation, output, report, external_bed=None, normalized
         report["exon_model_source"] = "explicit GTF exon records"
     records, counts = read_gtf_models(normalized)
     report.update(counts)
+    if counts["short_intron_merges"]:
+        print(f'[WARNING] Matched StringTie 2.2.3 reference loading: merged '
+              f'{len(counts["short_intron_merges"])} intron(s) of 1-4 bp, adding '
+              f'{counts["short_intron_added_exonic_bases"]} exonic bases; '
+              'see short_intron_merges in the reference report. Source annotation is unchanged.', file=sys.stderr)
     if expected_ids is not None:
         missing = expected_ids - {row["name"] for row in records}
         if missing:
@@ -391,19 +474,11 @@ def prepare_annotation(annotation, output, report, external_bed=None, normalized
         if missing or extra or changed:
             raise ValueError(f"external BED12 does not match annotation: {len(missing)} missing, {len(extra)} extra, {len(changed)} inconsistent transcript model(s)")
         report["external_bed12_validation"] = "exact transcript ID, chromosome, strand, interval, and exon-block match"
-    if normalized_gtf and report["annotation_format"] == "gtf":
-        destination = Path(normalized_gtf)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(dir=destination.parent, prefix=destination.name + ".", delete=False) as handle:
-                temporary = Path(handle.name)
-            shutil.copyfile(source, temporary)
-            temporary.replace(destination)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+    if normalized_gtf or report["annotation_format"] == "gff3":
+        destination = Path(normalized_gtf) if normalized_gtf else normalized
+        write_model_gtf(records, destination)
         report["normalized_annotation"] = str(destination)
+        report["normalized_model_format"] = "explicit transcript/exon GTF from validated exon blocks"
     write_bed12(records, output)
     report.update(status="passed", transcript_count=len(records), reference_sequence_count=len({row["chrom"] for row in records}))
 
@@ -414,7 +489,7 @@ def main(argv=None):
     parser.add_argument("--output", required=True, help="Validated BED12 output")
     parser.add_argument("--report", required=True, help="JSON validation report, including failures")
     parser.add_argument("--bed12", help="Optional external BED12; must exactly match annotation models")
-    parser.add_argument("--normalized-gtf", help="Validated GTF for StringTie and matrices; GTF inputs are copied without changing IDs")
+    parser.add_argument("--normalized-gtf", help="Canonical transcript/exon GTF for StringTie and matrices; source IDs are preserved")
     args = parser.parse_args(argv)
     # Never overwrite source annotations, or confuse report and result paths.
     sources = [args.annotation]

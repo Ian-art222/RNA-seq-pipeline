@@ -17,6 +17,8 @@ import sys
 import tempfile
 from collections import defaultdict
 
+from prepare_strand_bed import read_gtf_models
+
 ATTR = re.compile(r'(?:^|;)\s*([^\s;]+)\s+"([^"]*)"\s*(?=;|$)')
 
 
@@ -94,7 +96,29 @@ def read_lengths(args, samples):
     return {sample: positive_length(value, f'read length for {sample}') for sample, value in values.items()}
 
 
+def parse_reference_gtf(path, gene_id_only=False):
+    """Use the validated exon model parser shared with reference preparation.
+
+    Reference GTF may be exon-only or contain CDS/UTR/codon metadata. Coverage
+    and StringTie command provenance belong exclusively to quantified output.
+    """
+    records, _ = read_gtf_models(path)
+    models = {}
+    for row in records:
+        gid, symbol = row['gene_id'], row['gene_name']
+        exons = tuple((start + 1, end) for start, end in row['blocks'])
+        models[row['name']] = dict(
+            gene=gid if gene_id_only or not symbol else gid + '|' + symbol,
+            canonical_gene=gid, chrom=row['chrom'], strand=row['strand'],
+            start=row['start'] + 1, end=row['end'], coverage=0.0,
+            exons=exons, length=sum(end - start + 1 for start, end in exons))
+    return models
+
+
 def parse_gtf(path, gene_id_only=False, reference=False):
+    if reference:
+        return parse_reference_gtf(path, gene_id_only)
+    path = Path(path)
     transcripts, exons = {}, defaultdict(list)
     command_seen = False
     with path.open(encoding='utf-8') as handle:
@@ -108,8 +132,6 @@ def parse_gtf(path, gene_id_only=False, reference=False):
             fields = line.rstrip('\n').split('\t')
             if len(fields) != 9:
                 raise ValueError(f'{path}:{number}: expected nine GTF fields')
-            if reference and fields[2] == 'gene':
-                continue
             if fields[2] not in ('transcript', 'exon'):
                 raise ValueError(f'{path}:{number}: unexpected StringTie feature {fields[2]!r}')
             start, end = int(fields[3]), int(fields[4])
@@ -122,9 +144,9 @@ def parse_gtf(path, gene_id_only=False, reference=False):
             if fields[2] == 'transcript':
                 if tid in transcripts:
                     raise ValueError(f'{path}:{number}: duplicate transcript {tid}')
-                if not reference and 'cov' not in attrs:
+                if 'cov' not in attrs:
                     raise ValueError(f'{path}:{number}: missing transcript coverage')
-                coverage = 0.0 if reference else float(attrs['cov'])
+                coverage = float(attrs['cov'])
                 if not math.isfinite(coverage) or coverage < 0:
                     raise ValueError(f'{path}:{number}: coverage must be finite and nonnegative')
                 symbol = attrs.get('gene_name') or attrs.get('ref_gene_name')
@@ -133,7 +155,7 @@ def parse_gtf(path, gene_id_only=False, reference=False):
                                         start=start, end=end, coverage=coverage)
             else:
                 exons[tid].append((fields[0], fields[6], start, end, gid))
-    if not reference and not command_seen:
+    if not command_seen:
         raise ValueError(f'{path}: missing StringTie -e -G command provenance')
     if not transcripts:
         raise ValueError(f'{path}: no quantified transcript models')

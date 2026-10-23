@@ -1,5 +1,7 @@
 # 全部修复恢复及 MAPQ 0 验证（2026-10-23）
 
+> 2026-10-23 后续更正：本轮测试遗漏了原始 GTF → prepDE 的参考解析兼容性，默认 CtZJ 的 exon + CDS 注释也会触发。该缺陷及短内含子模型差异已另行修复，见 [GTF_REFERENCE_FIX_20261023.md](GTF_REFERENCE_FIX_20261023.md)。以下保留当时的验证记录和边界。
+
 新版源码：`/home/weiyuekuan/12.Snakemake/4.RNA-seq-pipeline`。
 
 已在 GitHub 原版 `8d6a389d1e8b1980333d570c03667bf16b69f900` 基础上恢复本次对话中的全部修复和改进，并将比对 BAM 的默认 MAPQ 过滤值改为 0。**完整回归 164 个测试方法全部通过：0 失败、0 错误、0 跳过，146.271 秒。**

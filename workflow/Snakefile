@@ -271,7 +271,8 @@ if FASTP_ENABLED:
             r1=get_raw_r1,
             r2=get_raw_r2,
             script=FASTP_SCRIPT,
-            read_length_script=READ_LENGTH_SCRIPT
+            read_length_script=READ_LENGTH_SCRIPT,
+            validated_reference=ancient(NORMALIZED_GTF)
         output:
             r1=str(CLEAN_DIR / "{sample}" / ("{sample}" + R1_SUFFIX)),
             r2=str(CLEAN_DIR / "{sample}" / ("{sample}" + R2_SUFFIX)),
@@ -304,7 +305,8 @@ if FASTP_ENABLED:
 
 rule measure_read_lengths:
     input:
-        r1=get_r1, r2=get_r2, script=READ_LENGTH_SCRIPT
+        r1=get_r1, r2=get_r2, script=READ_LENGTH_SCRIPT,
+        validated_reference=ancient(NORMALIZED_GTF)
     output:
         report=READ_LENGTH_REPORT
     log:
@@ -341,6 +343,7 @@ rule hisat2_align_sort:
         r1=get_r1,
         r2=get_r2,
         read_lengths=READ_LENGTH_REPORT,
+        validated_reference=ancient(NORMALIZED_GTF),
         index_files=HISAT2_INDEX_FILES,
         splice_inputs=HISAT_EXTRA_INPUTS,
         script=str(SCRIPTS_DIR / "align_reads.py")
@@ -588,7 +591,8 @@ rule prepde_raw_counts:
         lengths=READ_LENGTHS,
         reference=NORMALIZED_GTF,
         transcript_tables=expand(str(QUANT_DIR / "{sample}" / "t_data.ctab"), sample=SAMPLES) if USE_BALLGOWN else [],
-        script=str(PREPDE_SCRIPT)
+        script=str(PREPDE_SCRIPT),
+        reference_parser=BED_SCRIPT
     output:
         raw_count=str(QUANT_DIR / "gene_count_matrix.raw.csv"),
         transcript_count=str(QUANT_DIR / "transcript_count_matrix.csv")
